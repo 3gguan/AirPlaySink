@@ -1,0 +1,7 @@
+<resources>
+    <color name="sink_background">#FF101216</color>
+    <color name="sink_surface">#FF1B1F26</color>
+    <color name="sink_accent">#FF3DDC84</color>
+    <color name="sink_text">#FFF2F4F8</color>
+    <color name="sink_text_dim">#FF9AA3B2</color>
+</resources>

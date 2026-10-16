@@ -1,0 +1,55 @@
+<resources>
+    <string name="app_name">AirPlay 车机</string>
+    <string name="service_label">AirPlay 接收服务</string>
+    <string name="service_channel_description">车机作为 AirPlay 音箱运行时的常驻通知</string>
+    <string name="notification_stop">停止</string>
+
+    <string name="switch_on">已开启</string>
+    <string name="switch_off">已关闭</string>
+
+    <string name="ui_headline">AirPlay 音频接收</string>
+    <string name="ui_hint">先让车机连上 iPhone 的个人热点，再打开下面的开关。之后在 iPhone 的控制中心或音乐 App 的播放设备列表里就能看到本车机。</string>
+
+    <string name="ui_service_switch">接收服务</string>
+    <string name="ui_start_on_boot">开机后自动开启</string>
+
+    <string name="ui_device_name">车机名称</string>
+    <string name="ui_device_name_hint">在 iPhone 的 AirPlay 列表里显示的名字</string>
+    <string name="ui_apply_name">保存并重启服务</string>
+    <string name="ui_name_saved">名称已保存</string>
+    <string name="ui_name_applied">名称已保存，正在重启服务</string>
+
+    <string name="ui_status">状态</string>
+    <string name="ui_state_starting">启动中…</string>
+    <string name="ui_state_waiting_network">等待网络…</string>
+    <string name="ui_state_streaming">正在接收音频</string>
+    <string name="ui_state_client">已连接，等待播放</string>
+    <string name="ui_state_running">运行中，等待 iPhone</string>
+    <string name="ui_state_stopped">未运行</string>
+
+    <string name="ui_address">监听地址</string>
+    <string name="ui_advertised_name">广播名称</string>
+    <string name="ui_port">控制端口</string>
+    <string name="ui_client">连接的 iPhone</string>
+    <string name="ui_now_playing">正在播放</string>
+    <string name="ui_volume">音量</string>
+    <string name="ui_remote_control">反向控制</string>
+    <string name="ui_remote_control_ready">可用</string>
+    <string name="ui_remote_control_pending">等待 iPhone 提供</string>
+    <string name="ui_empty">—</string>
+
+    <string name="ui_control_previous">上一首</string>
+    <string name="ui_control_play_pause">播放/暂停</string>
+    <string name="ui_control_next">下一首</string>
+    <string name="ui_control_sent">已发送：%1$s</string>
+    <string name="ui_control_unavailable">反向控制暂不可用，请先让 iPhone 连上本车机</string>
+
+    <string name="ui_log">运行日志</string>
+    <string name="ui_log_empty">（暂无日志）</string>
+    <string name="ui_clear_log">清空</string>
+    <string name="ui_copy_log">复制</string>
+    <string name="ui_log_copied">日志已复制到剪贴板</string>
+    <string name="ui_no_log_to_copy">没有可复制的日志</string>
+
+    <string name="ui_notification_permission">未授予通知权限，后台运行时的通知不会显示</string>
+</resources>

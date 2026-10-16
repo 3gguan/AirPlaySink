@@ -1,0 +1,33 @@
+# --- Gradle ---
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# --- Kotlin ---
+.kotlin/
+
+# --- Android Studio / IntelliJ ---
+.idea/
+*.iml
+*.hprof
+captures/
+.externalNativeBuild/
+.cxx/
+
+# --- Local machine config (absolute SDK path, never share) ---
+local.properties
+
+# --- Build outputs ---
+*.apk
+*.aab
+*.ap_
+dist/
+
+# --- Signing material ---
+*.jks
+*.keystore
+*.p12
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db
