@@ -79,6 +79,29 @@ class RaopSession(
     private companion object {
         const val CONTROL_LATENCY_FRAMES = 11025 // what the AirPort Express reports after RECORD
         const val SILENT_DB = -144.0
+
+        /**
+         * The AirPlay device volume, remembered across control connections.
+         *
+         * iOS opens a fresh control connection whenever it re-negotiates and only pushes a
+         * `volume:` line on *some* of them, so a session that starts at unity gain plays at full
+         * blast until the sender happens to send the value. That is heard as "it suddenly got loud
+         * after switching tracks", and re-selecting the output cures it. A real receiver has no such
+         * hole: shairport-sync keeps this in `config.airplay_volume` and seeds every new session
+         * from it (player.c: "set the default volume to whatever it was before, as stored in the
+         * config airplay_volume"). Its `GET_PARAMETER volume` answer reads the same value, so it is
+         * also what this session must report before the sender says anything.
+         */
+        @Volatile
+        private var rememberedVolumeDb = 0.0
+
+        /** The gain the sender's dB value asks for; -144 dB is mute, not "very quiet". */
+        private fun linearGain(decibels: Double): Float =
+            if (decibels <= SILENT_DB) {
+                0f
+            } else {
+                10.0.pow(decibels / 20.0).toFloat().coerceIn(0f, 1f)
+            }
     }
 
     private val input: InputStream = socket.getInputStream()
@@ -110,8 +133,9 @@ class RaopSession(
     @Volatile
     private var closed = false
 
-    private var volumeDb = 0.0
-    private var currentLinearVolume = 1.0f
+    /** This session's volume; it starts where the previous session left off, never at full gain. */
+    private var volumeDb = rememberedVolumeDb
+    private var currentLinearVolume = linearGain(rememberedVolumeDb)
 
     private var progressCurrent = 0
     private var progressTotal = 0
@@ -348,7 +372,17 @@ class RaopSession(
         audioPipeline.setVolume(currentLinearVolume)
         streaming = true
         events.onStreamingStarted()
-        SinkLog.i("RECORD: playback started")
+        // The gain printed here is the one the session actually plays at: when the sender never
+        // sends a `volume:` line this stays 1.0000, which is the difference between "loud" and
+        // "quiet after the reconnect" in a single line of the log.
+        SinkLog.i(
+            String.format(
+                java.util.Locale.US,
+                "RECORD: playback started at gain %.4f (%.2f dB)",
+                currentLinearVolume,
+                volumeDb,
+            ),
+        )
 
         return RtspResponse(200)
             .addHeader("Audio-Latency", CONTROL_LATENCY_FRAMES.toString())
@@ -392,8 +426,21 @@ class RaopSession(
 
     private fun applyVolume(decibels: Double) {
         volumeDb = decibels.coerceIn(SILENT_DB, 0.0)
-        val linear = if (volumeDb <= SILENT_DB) 0.0 else 10.0.pow(volumeDb / 20.0)
-        currentLinearVolume = linear.toFloat().coerceIn(0f, 1f)
+        rememberedVolumeDb = volumeDb
+        currentLinearVolume = linearGain(volumeDb)
+        // The value the sender sends is the *AirPlay device* volume: 0.00 dB at the top of the
+        // slider down to -30.00 dB at the bottom, with -144.00 meaning mute (shairport-sync's
+        // `pvol` note). Log it verbatim together with the gain we end up applying — "it got quieter
+        // after X" is otherwise impossible to attribute to either end of the link.
+        SinkLog.i(
+            String.format(
+                java.util.Locale.US,
+                "Volume: sender asked for %.2f dB -> gain %.4f (%s)",
+                decibels,
+                currentLinearVolume,
+                if (pipeline == null) "no audio output yet, carried to RECORD" else "applied now",
+            ),
+        )
         pipeline?.setVolume(currentLinearVolume)
         events.onVolumeChanged(volumeDb)
     }
