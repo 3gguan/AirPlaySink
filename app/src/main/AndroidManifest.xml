@@ -13,6 +13,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- On Android 12+ a granted overlay permission exempts background foreground-service starts.
+             It is also how the receiver revives itself after a process kill with the screen off. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Lets the app ask (with a dialog) to be exempted from Doze / App Standby, which some head
+         unit power managers run aggressively. The permission only enables the request dialog. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- The receive and decode threads are raised to audio priority so the head unit cannot starve
          them mid-stream; Process.setThreadPriority refuses that range without this permission. -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
@@ -22,6 +28,7 @@
         android:maxSdkVersion="28" />
 
     <application
+        android:name=".SinkApp"
         android:allowBackup="true"
         android:icon="@drawable/ic_sink"
         android:label="@string/app_name"
@@ -55,6 +62,17 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- android.net.wifi.STATE_CHANGE still reaches manifest receivers on Android 10 and is
+             how the service is brought back after the process died with the screen off. -->
+        <receiver
+            android:name=".NetworkAutoStartReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.net.wifi.STATE_CHANGE" />
             </intent-filter>
         </receiver>
     </application>

@@ -20,6 +20,9 @@
 | **DACP 反向控制**（用方向盘 / 界面按钮遥控 iPhone 切歌、播放暂停） | ✅ |
 | 前台服务 + Wi-Fi Lock + Multicast Lock，息屏继续接收 | ✅ |
 | 开机自启（可选） | ✅ |
+| 进程被杀后自动恢复（START_STICKY + 网络事件拉起） | ✅ |
+| 电池优化豁免（界面申请 + adb 白名单说明） | ✅ |
+| 日志落盘文件（自动轮转） | ✅ |
 | **视频 / 屏幕镜像** | ❌ 全部去掉 |
 | **AirPlay 2（配对、`_airplay._tcp`）** | ❌ 故意不广播，避免 iOS 走 AP2 / CarPlay 协商 |
 | **USB / Wi-Fi Direct / 车机开热点 / VPN / 蓝牙 RFCOMM / iAP2 / MFi** | ❌ 全部去掉 |
@@ -108,6 +111,45 @@ Android 的 mDNS 由**系统守护进程 `mdnsd`** 统一代理（`NsdManager` �
 | `CHANGE_WIFI_MULTICAST_STATE` | 拿不到 `MulticastLock`。Wi-Fi 驱动会把组播整包滤掉，**mDNS 彻底收不到** |
 
 这两个锁是**各自独立获取**的：任何一个失败都不会连累另一个，失败会在日志里明写（`Locks: wifi=true multicast=true` 这行就是给这个用的）。
+
+### 后台常驻（比亚迪 DiLink）
+
+针对 DiLink 3.0（Android 10，Qualcomm trinket）的常驻由四层组成：
+
+| 层 | 机制 | 覆盖场景 |
+| --- | --- | --- |
+| 前台服务 | `mediaPlayback` 类型 + 常驻通知 + `MediaSession` | 息屏后继续运行的主依据，车机认可"用户可感知"的后台 |
+| 锁 | `WifiLock(FULL_HIGH_PERF)` + `MulticastLock` + 音频线程提权 | 息屏时热点链路不断、mDNS 可达、收流不被饿死 |
+| 自启 | `BOOT_COMPLETED` / `QUICKBOOT_POWERON` / `MY_PACKAGE_REPLACED`（受"开机后自动开启"开关控制） | 车机冷启动、OTA 覆盖安装后自动拉起 |
+| 复活 | `START_STICKY`（进程被杀后系统重建）+ `NetworkAutoStartReceiver`（监听 `android.net.wifi.STATE_CHANGE`，网络一通就把服务拉回来） | 系统省电策略杀进程、LMK 回收后自动恢复 |
+
+**电池优化豁免**：主界面"后台保活"一栏可以申请跳过 Doze / 后台冻结（`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`）。如果车机 ROM 把弹窗去掉了，用 adb 直接加白名单：
+
+```bash
+adb shell dumpsys deviceidle whitelist + com.shilapi.airplaysink
+adb shell appops set com.shilapi.airplaysink SYSTEM_ALERT_WINDOW allow
+```
+
+第二条尤其重要：本机实测车机是 **Android 12**，这个版本起"后台启动前台服务"受限，而 `SYSTEM_ALERT_WINDOW` 是官方豁免项——拿到它，`NetworkAutoStartReceiver` 才能在息屏被杀后真正把服务拉起来。
+
+**已知边界**：如果用户在最近任务里**上滑清掉**应用，DiLink 走的是 force-stop —— Android 会停止向 force-stop 的应用投递一切广播，`START_STICKY` 和网络 receiver 都不会生效，只能下次开机或手动打开应用恢复。这是平台行为，没有应用层的绕过方法（DiPlay 靠 USB 插入 / 蓝牙连接的 activity 拉起，纯热点场景没有对应入口）。正常使用（打开开关、不清后台）可以长期常驻。
+
+### 日志文件
+
+界面上的日志只是内存里最近 400 行；完整日志会异步追加写到文件，进程重启不丢：
+
+```
+/storage/emulated/0/Android/data/com.shilapi.airplaysink/files/sink.log
+```
+
+- 超过 1 MiB 自动轮转成 `sink.log.old`（只保留一份），磁盘占用封顶约 2 MiB；
+- 每次进程启动在文件里写一行 `---- process start ----` 分隔标记；
+- 界面的"清空"只清内存视图，不动文件（文件是事后排障用的）；
+- 用 adb 取回：
+
+```bash
+adb shell cat /storage/emulated/0/Android/data/com.shilapi.airplaysink/files/sink.log > sink.log
+```
 
 ### DACP 反向控制（为什么只有这条路）
 

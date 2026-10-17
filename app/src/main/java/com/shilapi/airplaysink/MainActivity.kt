@@ -4,9 +4,13 @@ import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -41,6 +45,8 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     private lateinit var rootScroll: ScrollView
     private lateinit var serviceSwitch: SwitchCompat
     private lateinit var bootSwitch: SwitchCompat
+    private lateinit var batteryState: TextView
+    private lateinit var batteryApplyButton: Button
     private lateinit var deviceNameInput: EditText
     private lateinit var bufferSeek: SeekBar
     private lateinit var bufferValue: TextView
@@ -102,6 +108,10 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
             preferences.startOnBoot = checked
         }
 
+        batteryState = findViewById(R.id.batteryState)
+        batteryApplyButton = findViewById(R.id.batteryApplyButton)
+        batteryApplyButton.setOnClickListener { requestIgnoreBatteryOptimizations() }
+
         bufferSeek.max = SinkPreferences.BUFFER_CHOICES.size - 1
         bufferSeek.progress = bufferIndex(preferences.bufferMs)
         renderBufferLabel()
@@ -152,6 +162,13 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         SinkLog.listener = logListener
         SinkModel.addListener(this)
         renderLog()
+        renderBatteryState()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // The user may have answered the exemption dialog in system settings; re-read it.
+        renderBatteryState()
     }
 
     override fun onStop() {
@@ -397,6 +414,38 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         toast(getString(R.string.ui_name_applied))
         SinkService.stop(this)
         rootScroll.postDelayed({ SinkService.start(this) }, RESTART_DELAY_MS)
+    }
+
+    // ------------------------------------------------------------------ battery optimization
+
+    /**
+     * Some head unit power managers (DiLink among them) put Doze or background freezes on apps
+     * that are merely "not important", which can stall the hotspot link with the screen off. An
+     * exemption is the standard, user-visible way out; ROMs that removed the dialog fall back to
+     * the adb command shown in the hint.
+     */
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        val power = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
+        return power.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun renderBatteryState() {
+        val exempt = isIgnoringBatteryOptimizations()
+        batteryState.setText(
+            if (exempt) R.string.ui_battery_state_exempt else R.string.ui_battery_state_not_exempt,
+        )
+        batteryApplyButton.visibility = if (exempt) View.GONE else View.VISIBLE
+    }
+
+    private fun requestIgnoreBatteryOptimizations() {
+        if (isIgnoringBatteryOptimizations()) return
+        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            .setData(Uri.parse("package:$packageName"))
+        runCatching { startActivity(intent) }
+            .onFailure {
+                toast(getString(R.string.ui_battery_request_failed))
+                SinkLog.w("Battery exemption dialog unavailable: ${it.message}")
+            }
     }
 
     // ------------------------------------------------------------------ plumbing

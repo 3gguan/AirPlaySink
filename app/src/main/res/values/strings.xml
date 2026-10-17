@@ -13,6 +13,13 @@
     <string name="ui_service_switch">接收服务</string>
     <string name="ui_start_on_boot">开机后自动开启</string>
 
+    <string name="ui_battery">后台保活</string>
+    <string name="ui_battery_state_exempt">已忽略电池优化</string>
+    <string name="ui_battery_state_not_exempt">未忽略电池优化，可能被系统省电策略限制</string>
+    <string name="ui_battery_apply">申请忽略电池优化</string>
+    <string name="ui_battery_hint">允许系统跳过对本应用的省电限制（Doze / 后台冻结）。部分车机的省电策略没有这个弹窗，可以用 adb 执行：adb shell dumpsys deviceidle whitelist + com.shilapi.airplaysink</string>
+    <string name="ui_battery_request_failed">本车机不支持该申请弹窗，请使用界面提示的 adb 命令</string>
+
     <string name="ui_buffer">缓冲深度</string>
     <string name="ui_buffer_value">%1$d ms</string>
     <string name="ui_buffer_value_pending">%1$d ms · 需重启服务生效</string>
