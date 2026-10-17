@@ -60,4 +60,21 @@ object Codec {
         out[offset] = ((value ushr 8) and 0xFF).toByte()
         out[offset + 1] = (value and 0xFF).toByte()
     }
+
+    fun putBe32(out: ByteArray, offset: Int, value: Int) {
+        out[offset] = (value ushr 24).toByte()
+        out[offset + 1] = (value ushr 16).toByte()
+        out[offset + 2] = (value ushr 8).toByte()
+        out[offset + 3] = value.toByte()
+    }
+
+    /** 64-bit big-endian read (e.g. an NTP timestamp), returned as unsigned in a [Long]. */
+    fun be64(data: ByteArray, offset: Int): Long =
+        (be32(data, offset).toLong() and 0xFFFFFFFFL shl 32) or
+            (be32(data, offset + 4).toLong() and 0xFFFFFFFFL)
+
+    fun putBe64(out: ByteArray, offset: Int, value: Long) {
+        putBe32(out, offset, (value ushr 32).toInt())
+        putBe32(out, offset + 4, value.toInt())
+    }
 }

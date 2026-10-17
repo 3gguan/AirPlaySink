@@ -40,6 +40,20 @@ class SinkPreferences(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_START_ON_BOOT, value).apply()
 
     /**
+     * How much audio to hold in front of the speaker, in milliseconds.
+     *
+     * The receiver's latency and its tolerance for a stalling link are the same number, so this is
+     * the knob for "it still hiccups sometimes" — at the price of the speaker falling further
+     * behind the phone. Read when a session is set up, so a change lands on the next one.
+     */
+    var bufferMs: Int
+        get() = prefs.getInt(KEY_BUFFER_MS, DEFAULT_BUFFER_MS)
+            .coerceIn(BUFFER_CHOICES.first(), BUFFER_CHOICES.last())
+        set(value) = prefs.edit()
+            .putInt(KEY_BUFFER_MS, value.coerceIn(BUFFER_CHOICES.first(), BUFFER_CHOICES.last()))
+            .apply()
+
+    /**
      * A stable 12 hex digit identifier. iOS only uses it to tell devices apart, so a random value
      * generated once on first run is enough - and it avoids depending on the Wi-Fi MAC address,
      * which Android hides or randomises.
@@ -69,6 +83,19 @@ class SinkPreferences(context: Context) {
         private const val KEY_STATUS_FLAGS = "status_flags"
         private const val KEY_SERVICE_ENABLED = "service_enabled"
         private const val KEY_START_ON_BOOT = "start_on_boot"
+        private const val KEY_BUFFER_MS = "buffer_ms"
+
+        /**
+         * The buffer sizes the main screen offers, in milliseconds.
+         *
+         * Coarse on purpose: the difference between 250 and 300 ms is not something anyone can
+         * hear or tune by ear, while the difference between 250 and 2000 is the difference between
+         * a link that drops out and one that does not.
+         */
+        val BUFFER_CHOICES = intArrayOf(250, 400, 600, 800, 1000, 1500, 2000)
+
+        /** What an AirPort Express reports, and what the pipeline was tuned against. */
+        const val DEFAULT_BUFFER_MS = 250
 
         /**
          * `AirPort4,107` is the AirPort Express audio model. It is the safest thing to claim for an

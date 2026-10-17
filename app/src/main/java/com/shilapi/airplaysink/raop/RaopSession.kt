@@ -61,6 +61,14 @@ data class RaopServerConfig(
     val statusFlags: Int,
     val firmwareVersion: String,
     val localAddress: InetAddress,
+    /**
+     * How much audio the receiver holds in front of the speaker, i.e. its own latency.
+     *
+     * The sender is told this number twice — once as the `Audio-Latency` header of the RECORD
+     * reply, and once implicitly by how far ahead it should be streaming — so it has to be the
+     * figure playback actually runs at, not the protocol's stock 250 ms.
+     */
+    val cushionMs: Int = 250,
 )
 
 /**
@@ -77,8 +85,19 @@ class RaopSession(
 ) : Closeable {
 
     private companion object {
-        const val CONTROL_LATENCY_FRAMES = 11025 // what the AirPort Express reports after RECORD
+        /** What the AirPort Express reports after RECORD: 250 ms at 44.1 kHz. The floor for ours. */
+        const val CONTROL_LATENCY_FRAMES = 11025
         const val SILENT_DB = -144.0
+
+        /**
+         * Kernel receive buffer for the audio port, about six seconds of stream at 44.1 kHz stereo.
+         *
+         * The reader drains it as fast as datagrams arrive, so in normal running it sits near empty
+         * and costs nothing. It only fills up when this process is descheduled — and that is exactly
+         * the moment dropping packets at the socket, rather than holding them for a few
+         * milliseconds, is the difference between a hiccup and a hole in the audio.
+         */
+        const val AUDIO_RECEIVE_BUFFER_BYTES = 1 shl 20
 
         /**
          * The AirPlay device volume, remembered across control connections.
@@ -117,6 +136,22 @@ class RaopSession(
     }
 
     private var announce: AnnounceInfo? = null
+
+    /**
+     * The receiver's own latency, in frames, as the sender is told it.
+     *
+     * RAOP has exactly one field for this: the `Audio-Latency` header of the RECORD reply
+     * (shairport-sync answers it too, and an AirPort Express says 11025 — 250 ms at 44.1 kHz).
+     * It describes how far behind the speaker the receiver plays, so it has to follow the cushion
+     * actually in use; reporting 250 ms while holding two seconds is a number the sender may
+     * believe when it lines this sink up against another room or against video.
+     */
+    private val audioLatencyFrames: Int
+        get() {
+            val rate = announce?.sampleRate?.coerceIn(8000, 96000) ?: 44100
+            val frames = rate.toLong() * config.cushionMs / 1000
+            return frames.coerceIn(CONTROL_LATENCY_FRAMES.toLong(), 96000L * 30).toInt()
+        }
     private var sessionKey: ByteArray? = null
     private var pipeline: AudioPipeline? = null
     private var transport: RaopAudioTransport? = null
@@ -303,10 +338,11 @@ class RaopSession(
         }
 
         senderControl = InetSocketAddress(socket.inetAddress, controlPort)
+        val senderTiming = InetSocketAddress(socket.inetAddress, timingPort)
         releaseAudioResources()
 
         // Wildcard bindings, in the sender's own address family — see openDatagramSocket.
-        val data = openDatagramSocket(socket.inetAddress)
+        val data = openDatagramSocket(socket.inetAddress, AUDIO_RECEIVE_BUFFER_BYTES)
         val control = openDatagramSocket(socket.inetAddress)
         val timing = openDatagramSocket(socket.inetAddress)
         audioSocket = data
@@ -323,15 +359,18 @@ class RaopSession(
             sampleRate = sampleRate,
             channels = channels,
             framesPerPacket = framesPerPacket,
+            cushionMs = config.cushionMs,
         )
         val audioTransport = RaopAudioTransport(
             audioSocket = data,
             controlSocket = control,
             timingSocket = timing,
             senderControl = senderControl,
+            senderTiming = senderTiming,
             pipeline = audioPipeline,
             sessionKey = sessionKey,
             sessionIv = info.aesIv,
+            maxResendAttempts = RaopAudioTransport.attemptsFor(audioPipeline.gapWaitMs),
         )
         pipeline = audioPipeline
         transport = audioTransport
@@ -342,6 +381,11 @@ class RaopSession(
                 "data=${data.localAddress.hostAddress}:${data.localPort} " +
                 "control=${control.localAddress.hostAddress}:${control.localPort} " +
                 "timing=${timing.localAddress.hostAddress}:${timing.localPort}",
+        )
+        SinkLog.i(
+            "SETUP: cushion ${config.cushionMs}ms, gap window ${audioPipeline.gapWaitMs}ms, " +
+                "up to ${audioTransport.maxResendAttempts} resend attempts, " +
+                "Audio-Latency will be $audioLatencyFrames frames",
         )
 
         return RtspResponse(200)
@@ -364,7 +408,7 @@ class RaopSession(
         }
         if (streaming) {
             SinkLog.w("Duplicate RECORD ignored")
-            return RtspResponse(200).addHeader("Audio-Latency", CONTROL_LATENCY_FRAMES.toString())
+            return RtspResponse(200).addHeader("Audio-Latency", audioLatencyFrames.toString())
         }
 
         audioPipeline.start()
@@ -378,14 +422,17 @@ class RaopSession(
         SinkLog.i(
             String.format(
                 java.util.Locale.US,
-                "RECORD: playback started at gain %.4f (%.2f dB)",
+                "RECORD: playback started at gain %.4f (%.2f dB); " +
+                    "reporting Audio-Latency %d frames (%d ms cushion)",
                 currentLinearVolume,
                 volumeDb,
+                audioLatencyFrames,
+                config.cushionMs,
             ),
         )
 
         return RtspResponse(200)
-            .addHeader("Audio-Latency", CONTROL_LATENCY_FRAMES.toString())
+            .addHeader("Audio-Latency", audioLatencyFrames.toString())
     }
 
     private fun setParameterResponse(request: RtspRequest): RtspResponse {
@@ -505,11 +552,18 @@ class RaopSession(
      * exactly as "the session came up but no audio ever arrives". The address itself stays the
      * wildcard, for the same reason the RTSP listener uses one: a head unit hosting the hotspot is
      * not "connected" to it, so no address-picking heuristic can find the right interface.
+     *
+     * [receiveBufferBytes] has to be set *before* the bind to size the real buffer; the kernel
+     * doubles it at bind time and clamps it to `net.core.rmem_max`.
      */
-    private fun openDatagramSocket(peer: InetAddress): DatagramSocket {
+    private fun openDatagramSocket(peer: InetAddress, receiveBufferBytes: Int = 0): DatagramSocket {
         val wildcard = InetAddress.getByName(if (peer is Inet6Address) "::" else "0.0.0.0")
         val socket = DatagramSocket(null)
         socket.reuseAddress = true
+        if (receiveBufferBytes > 0) {
+            runCatching { socket.receiveBufferSize = receiveBufferBytes }
+                .onFailure { SinkLog.w("Could not size the receive buffer: ${it.message}") }
+        }
         return try {
             socket.bind(InetSocketAddress(wildcard, 0))
             socket

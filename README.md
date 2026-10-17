@@ -242,6 +242,22 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 开关状态会被记住：进程被系统杀掉后再打开 App，服务会自动恢复运行。
 
+### 缓冲深度：可调的延迟
+
+界面上的「缓冲深度」滑块同时控制两件事 —— **播放延迟**和**抗抖动余量**，二者不可分离：
+音频被攒着不播，就是在等网络；攒得越多，越扛得住空口停顿，声音也越晚于手机。
+
+| 设置 | 适合 |
+| --- | --- |
+| 250 ms（默认，与 AirPort Express 一致） | 链路好，想跟手一点 |
+| 500~1000 ms | 热点信号一般，偶有顿挫 |
+| 2000 ms | 链路很差的最后手段；车机只出声音、不对画面，加到这个量级完全可用 |
+
+调整会同时放大配套参数：缺口等待窗口取余量的 3/4（200~900 ms），重传请求次数随窗口
+自动加到最多 12 次，`AudioTrack` 水库、预缓冲超时、以及 RECORD 应答里的 `Audio-Latency`
+头都按同一比例增长 —— iPhone 会按上报的延迟来对齐自己的进度条，所以调大只会"慢"，
+不会丢包。改动要生效需按「保存并重启服务」并在 iPhone 上重选一次输出。
+
 ### 关于网络：不用管，服务自己会等
 
 服务开启后**不关心车机连的是哪个网络，也不检查有没有连上 iPhone 热点**。逻辑只有一条：拿到任意一个可用的 IPv4 地址，就在它上面广播 —— Wi-Fi 优先，其它网络兜底。
@@ -291,7 +307,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | **连上瞬间就断，日志只有 `Control connection from` 紧跟 `Control connection closed`** | 发送端在等 `Apple-Response`。看 `RTSP <-` 那行里有没有 `apple-challenge=`：**有** → 我们没回或回错了（本版已实现，`RTSP ->` 那行之后应能看到 `Apple-Response`）；**没有** → 那是别的原因，看下一行的完整头 |
 | 日志里 `RTSP <-` 下一行的 `hdr:` 打出了完整请求头 | 这是诊断发送端行为的**主要依据**。把这两行截出来就能看出 iPhone 到底发了什么、我们回得对不对 |
 | 连上了但完全没声音 | 日志有没有 `First audio packet received`；有包但无声 → 看 `Dropping undecodable ALAC frame`；如果日志出现 `The sender chose AAC`，说明发送端选了本端不支持的编码 |
-| 声音断续 / 卡顿 | 看 `decoded N packets, skipped M, queued K`。`skipped` 持续增长说明丢包严重，检查热点信号 |
+| 声音断续 / 卡顿 | 看 `decoded N packets, skipped M, recovered R, concealed C, queued K, buffered Xms, underruns U`。① **`buffered` 是听感余量**（还没播出去的音频），也是抗抖动能力的全部来源 —— 它薄（几十毫秒）时任何停顿都会断；正常应稳定在 `AudioPipeline.TARGET_CUSHION_MS`（250 ms）附近。② **`underruns` 是 AudioTrack 自己数的欠载次数**：它在涨 = 卡顿属实且是饿死，不是拥塞。③ `recovered` 是"等重传等回来了"的包数，`skipped` 是等不到、直接放弃的包数 —— 前者远大于后者说明重传链路在正常工作。④ **`buffered` 只降不升说明余量在被跳号吃掉**：每跳一个包永久少 8 ms，而发送端按 1 倍速推流、不会补回来，实测 13 分钟里余量掉 114 ms 而 `skipped` 恰好 +14（×8 ms = 112 ms，误差 2%）—— 跳号是余量**唯一**的消耗项。⑤ `concealed` 是"放弃的缺口里补上了仿真音频"的包数：现在每个被放弃的包都会写一份前一帧的副本顶上，所以跳号**不再消耗余量**，`buffered` 应当长期平稳而不是缓慢下滑。副本不是原样重放：它以**说话人正握着的那个采样**开头（`DECLICK_FRAMES`、2 ms 内过渡掉），整段衰减到静音，后面的真实包再从静音淡入 2 ms —— 缺了这一步，重放的那 8 ms 就是一段满电平的方波接缝，听感就是一声爆音。⑥ 余量若因极端丢包被吃到 `REBUFFER_FLOOR_MS`（40 ms）以下，管线会暂停并重灌到目标余量，日志里是一条 `Cushion down to Xms; refilling` —— 代价是那一下约 250 ms 的静音，换来的是后面不再连续欠载。**这条日志正常应当只出现一次**：如果同一秒里连着刷出好几条（旧版在 FLUSH 后刷过 10 条），说明重灌逻辑在自激 —— 队列里已经攒够一整份余量时暂停毫无意义，等重灌完`primed` 又没被清掉，下一个包就会再触发一次。⑦ **`tooLate` 是"重传回来了、但播放已经走过去"的包数**，用来区分两种放弃：`tooLate` 跟 `skipped` 同步涨 = `GAP_WAIT_MS` 还短，加长能救回来；`tooLate` 长期为 0 = iPhone 压根没回包，再等也没用，只能靠隐藏。只统计**差 64 个包（512 ms）以内**的迟到：重传应答会把几秒前已经播过的包再发一遍，全算进来会让这个数虚高到 `skipped` 的三倍，那这个判据就白看了 |
+| 偶尔「爆音／咔哒」 | 几乎总是**跳号**（`skipped` 在涨）—— 波形被硬接一刀。判断方法：听的时候盯 `skipped`，它每次 +1 就是一声。要减少它，得让缺口尽量被重传补回来：`RaopAudioTransport` 现在对同一个缺口最多问 4 次（间隔 45 ms，最后一次在 135 ms 左右发出，仍落在 `GAP_WAIT_MS` 200 ms 内），限流时**放回队列**而不是直接丢弃（旧代码丢弃过，等于压根没问发送端），且 `RESEND_BACKOFF_MS` 已从 40 ms 降到 12 ms —— 包间隔才 8 ms，一次突发会同时压出好几个缺口，40 ms 的节流等于把第 4 个缺口拖到 160 ms 才问出去，早就错过播放点。如果 `skipped` 仍在涨，看 `recovered : skipped` 的比例和 `tooLate`：比例高且有 `tooLate` → 链路在丢包但重传能救，继续加 `GAP_WAIT_MS`；比例低且 `tooLate` 为 0 → iPhone 在忽略重传请求，只能靠隐藏 |
 | 息屏后停住 | 先看日志 `Locks: wifi=true multicast=true`（Wi-Fi 锁已持有，链路不会被挂起）；都正常还停，就是车机的省电策略把服务掐了，按上面的「不受限制」设置放开 |
 | 状态卡一直显示「等待网络…」 | 车机还没拿到 IPv4。去车机 Wi-Fi 设置确认已连上 iPhone 热点。**不用重开 App** —— 连上后服务会自己开始广播 |
 | 「反向控制」一直是"等待 iPhone 提供"，点按钮没反应 | 说明 `_dacp._tcp` 没解析出来。先看日志有没有 `Remote control offered: DACP-ID=... Active-Remote=...`（有 = iPhone 确实把凭据给了）；再看有没有 `DACP: "iTunes_Ctrl_..." at ...:port`（有 = 端口解析成功）。只有前者没有后者 → mDNS 应答被拦，或这台 iPhone 没广播这个服务 |
@@ -320,7 +337,7 @@ DACP: "iTunes_Ctrl_CFAE09D9DA7527E9" at 172.20.10.1:53111 (matched by DACP id)
 
 - 只支持 **ALAC** 和 **PCM**（按 `cn=0,1` 协商）。如果发送端坚持 AAC，本端会解不出来 —— 日志里会明说。
 - 单客户端：同一时刻只有一个 iPhone 能连，新连接会顶掉旧连接（这是 AirTunes 语义）。
-- 音频延迟按 RAOP 默认节奏走，没有做额外的时钟同步补偿；车机上听感延迟大约在百毫秒量级。
+- 音频延迟按 RAOP 默认节奏走，没有做额外的时钟同步补偿。听感延迟**等于**流水线手里握着多少音频（`AudioPipeline.TARGET_CUSHION_MS`，当前 250 ms）—— 余量就是延迟，**1:1，只能同增同减**：想更抗卡就得更慢，想更快就更脆。
 - ALAC 解码器与 iOS 实际码流的对照验证是在代码级完成的，**还没有在真机真流上长时间跑过**。
 - **DACP 反向控制也没有真机验证过**。请求格式、端口发现、命令集都是照 shairport-sync 的
   `dacp.c` 写的，但"iPhone 在这场 classic 会话里到底会不会广播 `_dacp._tcp`"只能上车实测。

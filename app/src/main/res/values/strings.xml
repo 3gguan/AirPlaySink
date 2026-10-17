@@ -13,6 +13,14 @@
     <string name="ui_service_switch">接收服务</string>
     <string name="ui_start_on_boot">开机后自动开启</string>
 
+    <string name="ui_buffer">缓冲深度</string>
+    <string name="ui_buffer_value">%1$d ms</string>
+    <string name="ui_buffer_value_pending">%1$d ms · 需重启服务生效</string>
+    <string name="ui_buffer_hint">缓冲同时是延迟和抗抖动的余量：越大越能吃掉网络停顿，声音也越落后于手机。250 ms 与原厂音箱一致；车里只听声音、不用对画面，链路不稳时可以放心加大。</string>
+    <string name="ui_apply_buffer">保存并重启服务</string>
+    <string name="ui_buffer_saved">缓冲设置已保存，下次连接时生效</string>
+    <string name="ui_buffer_applied">缓冲已设为 %1$d ms，正在重启服务</string>
+
     <string name="ui_device_name">车机名称</string>
     <string name="ui_device_name_hint">在 iPhone 的 AirPlay 列表里显示的名字</string>
     <string name="ui_apply_name">保存并重启服务</string>

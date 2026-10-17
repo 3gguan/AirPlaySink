@@ -14,6 +14,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -41,6 +42,8 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     private lateinit var serviceSwitch: SwitchCompat
     private lateinit var bootSwitch: SwitchCompat
     private lateinit var deviceNameInput: EditText
+    private lateinit var bufferSeek: SeekBar
+    private lateinit var bufferValue: TextView
     private lateinit var statusCard: LinearLayout
     private lateinit var logText: TextView
     private lateinit var previousButton: Button
@@ -74,6 +77,8 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         serviceSwitch = findViewById(R.id.serviceSwitch)
         bootSwitch = findViewById(R.id.bootSwitch)
         deviceNameInput = findViewById(R.id.deviceNameInput)
+        bufferSeek = findViewById(R.id.bufferSeek)
+        bufferValue = findViewById(R.id.bufferValue)
         statusCard = findViewById(R.id.statusCard)
         logText = findViewById(R.id.logText)
         previousButton = findViewById(R.id.previousButton)
@@ -96,6 +101,25 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         bootSwitch.setOnCheckedChangeListener { _, checked ->
             preferences.startOnBoot = checked
         }
+
+        bufferSeek.max = SinkPreferences.BUFFER_CHOICES.size - 1
+        bufferSeek.progress = bufferIndex(preferences.bufferMs)
+        renderBufferLabel()
+        bufferSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                // Only preview while dragging; the value is written on release so a drag across
+                // seven steps is one write, not seven.
+                if (fromUser) renderBufferLabel(SinkPreferences.BUFFER_CHOICES[progress])
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                preferences.bufferMs = SinkPreferences.BUFFER_CHOICES[bufferSeek.progress]
+                renderBufferLabel()
+            }
+        })
+        findViewById<View>(R.id.applyBufferButton).setOnClickListener { applyBuffer() }
 
         deviceNameInput.setText(preferences.deviceName)
         findViewById<View>(R.id.applyNameButton).setOnClickListener { applyDeviceName() }
@@ -233,6 +257,10 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         previousButton.isEnabled = remoteReady
         playPauseButton.isEnabled = remoteReady
         nextButton.isEnabled = remoteReady
+
+        // The service reports the cushion it actually started with, so the label can say when the
+        // slider has moved somewhere the running receiver has not caught up with yet.
+        renderBufferLabel()
     }
 
     private fun describeTrack(state: SinkModel.State): String {
@@ -316,6 +344,42 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         } else {
             toast(getString(R.string.ui_control_unavailable))
         }
+    }
+
+    // ------------------------------------------------------------------ buffer depth
+
+    /**
+     * The cushion is chosen before a session is set up, so a change only lands on the next one.
+     * Bouncing the service is the shortest honest way to get there: it is the same thing that
+     * happens when the phone re-selects this device, without making the user go and do it.
+     */
+    private fun applyBuffer() {
+        preferences.bufferMs = SinkPreferences.BUFFER_CHOICES[bufferSeek.progress]
+        if (!SinkService.isActive) {
+            toast(getString(R.string.ui_buffer_saved))
+            renderBufferLabel()
+            return
+        }
+        toast(getString(R.string.ui_buffer_applied, preferences.bufferMs))
+        SinkService.stop(this)
+        rootScroll.postDelayed({ SinkService.start(this) }, RESTART_DELAY_MS)
+    }
+
+    private fun renderBufferLabel(chosen: Int = preferences.bufferMs) {
+        val live = SinkModel.state.bufferMs
+        bufferValue.text = if (SinkService.isActive && live != chosen) {
+            getString(R.string.ui_buffer_value_pending, chosen)
+        } else {
+            getString(R.string.ui_buffer_value, chosen)
+        }
+    }
+
+    /** The stored value is one of the steps, but a value written by an older build may not be. */
+    private fun bufferIndex(ms: Int): Int {
+        val choices = SinkPreferences.BUFFER_CHOICES
+        val exact = choices.indexOf(ms)
+        if (exact >= 0) return exact
+        return choices.indices.minByOrNull { kotlin.math.abs(choices[it] - ms) } ?: 0
     }
 
     // ------------------------------------------------------------------ device name

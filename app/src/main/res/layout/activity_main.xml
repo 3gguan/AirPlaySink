@@ -94,6 +94,53 @@
             android:textColor="@color/sink_text"
             android:textSize="15sp" />
 
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/ui_buffer"
+                android:textColor="@color/sink_text"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/bufferValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/sink_text"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <SeekBar
+            android:id="@+id/bufferSeek"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:max="6" />
+
+        <TextView
+            android:id="@+id/bufferHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:lineSpacingExtra="2dp"
+            android:text="@string/ui_buffer_hint"
+            android:textColor="@color/sink_text_dim"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/applyBufferButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/ui_apply_buffer" />
+
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"

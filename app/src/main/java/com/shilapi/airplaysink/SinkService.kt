@@ -221,7 +221,9 @@ class SinkService : Service(), RaopEvents {
             statusFlags = preferences.statusFlags,
             firmwareVersion = Build.VERSION.RELEASE ?: "android",
             localAddress = endpoint.address,
+            cushionMs = preferences.bufferMs,
         )
+        SinkModel.update { it.copy(bufferMs = config.cushionMs) }
 
         val sink = RaopReceiver(config, this, this)
         receiver = sink

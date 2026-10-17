@@ -25,6 +25,8 @@ object SinkModel {
         val progressTotalSeconds: Int = 0,
         /** True once the sender has handed over a usable DACP reverse control endpoint. */
         val remoteControl: Boolean = false,
+        /** The cushion the receiver was started with, in milliseconds. */
+        val bufferMs: Int = 250,
         val lastError: String? = null,
         val lastStats: String? = null,
     )
