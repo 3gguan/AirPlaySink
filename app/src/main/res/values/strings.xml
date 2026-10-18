@@ -17,8 +17,10 @@
     <string name="ui_battery_state_exempt">已忽略电池优化</string>
     <string name="ui_battery_state_not_exempt">未忽略电池优化，可能被系统省电策略限制</string>
     <string name="ui_battery_apply">申请忽略电池优化</string>
-    <string name="ui_battery_hint">允许系统跳过对本应用的省电限制（Doze / 后台冻结）。部分车机的省电策略没有这个弹窗，可以用 adb 执行：adb shell dumpsys deviceidle whitelist + com.shilapi.airplaysink</string>
-    <string name="ui_battery_request_failed">本车机不支持该申请弹窗，请使用界面提示的 adb 命令</string>
+    <string name="ui_battery_hint">允许系统跳过对本应用的省电限制（Doze / 后台冻结）。部分车机（如比亚迪 DiLink）把系统设置页整个屏蔽了，点了只会提示"不支持该操作"，此时请用 adb 执行界面上复制的命令。</string>
+    <string name="ui_battery_adb_commands">adb shell dumpsys deviceidle whitelist +com.shilapi.airplaysink
+adb shell appops set com.shilapi.airplaysink SYSTEM_ALERT_WINDOW allow</string>
+    <string name="ui_battery_adb_copied">本车机没有这个设置页，已把 adb 命令复制到剪贴板</string>
 
     <string name="ui_buffer">缓冲深度</string>
     <string name="ui_buffer_value">%1$d ms</string>

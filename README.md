@@ -123,14 +123,41 @@ Android 的 mDNS 由**系统守护进程 `mdnsd`** 统一代理（`NsdManager` �
 | 自启 | `BOOT_COMPLETED` / `QUICKBOOT_POWERON` / `MY_PACKAGE_REPLACED`（受"开机后自动开启"开关控制） | 车机冷启动、OTA 覆盖安装后自动拉起 |
 | 复活 | `START_STICKY`（进程被杀后系统重建）+ `NetworkAutoStartReceiver`（监听 `android.net.wifi.STATE_CHANGE`，网络一通就把服务拉回来） | 系统省电策略杀进程、LMK 回收后自动恢复 |
 
-**电池优化豁免**：主界面"后台保活"一栏可以申请跳过 Doze / 后台冻结（`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`）。如果车机 ROM 把弹窗去掉了，用 adb 直接加白名单：
+**电池优化豁免**：主界面"后台保活"一栏可以申请跳过 Doze / 后台冻结（`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`）。
+
+> **这台车机的设置页是被阉过的**：DiLink 把 `android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` 注册到了一个占位 Activity
+> `com.byd.systemsettings/.unsupport.UnsupportActivity` 上，点「申请忽略电池优化」只会弹一句
+> **"多媒体系统不支持该操作"** 然后自己关掉。同一个 filter 里还挂着 `MANAGE_OVERLAY_PERMISSION`、
+> `MANAGE_UNKNOWN_APP_SOURCES`、`IGNORE_BATTERY_OPTIMIZATION_SETTINGS`、`AIRPLANE_MODE_SETTINGS`、
+> `NFC_SETTINGS`、`HOME_SETTINGS` 一大票 action —— 也就是说车机把大半个系统设置页都封了，
+> 不是本应用被针对。用 `adb shell cmd package resolve-activity -a <action> -d package:<pkg>` 就能看到落点。
+>
+> 应用侧对此做了处理：resolve 到 `unsupport` 占位页时**不启动它**，改为把下面的 adb 命令复制到剪贴板，
+> 避免又弹一次那句误导性的提示。
+
+车机上只能用 adb：
 
 ```bash
-adb shell dumpsys deviceidle whitelist + com.shilapi.airplaysink
+adb shell dumpsys deviceidle whitelist +com.shilapi.airplaysink
 adb shell appops set com.shilapi.airplaysink SYSTEM_ALERT_WINDOW allow
+adb shell appops set com.shilapi.airplaysink RUN_IN_BACKGROUND allow
+adb shell appops set com.shilapi.airplaysink RUN_ANY_IN_BACKGROUND allow
 ```
 
-第二条尤其重要：本机实测车机是 **Android 12**，这个版本起"后台启动前台服务"受限，而 `SYSTEM_ALERT_WINDOW` 是官方豁免项——拿到它，`NetworkAutoStartReceiver` 才能在息屏被杀后真正把服务拉起来。
+第一条把应用加进 Doze 白名单（`dumpsys deviceidle whitelist` 里应出现 `user,com.shilapi.airplaysink,<uid>`，
+界面随之变成「已忽略电池优化」）。
+
+`SYSTEM_ALERT_WINDOW` 是给 **Android 12+** 准备的：从 12 起"后台启动前台服务"受限，而这个权限是官方豁免项 ——
+拿到它，`NetworkAutoStartReceiver` 才能在息屏被杀后真正把服务拉起来。本机实测车机是 **Android 10（SDK 29）**，
+这一代还没有该限制，所以这条在本机只是预留；README 早前写的"Android 12"是误记。
+
+**车机自带的后台管理**还有一个入口：`com.byd.appstartmanagement`（界面标题「选择禁止后台启动项」，
+组件 `com.byd.appstartmanagement/.frame.AppStartManagement`）。注意它是**禁止**列表 —— 开关打开 =
+禁止后台启动。实测本应用默认就是关闭状态（未禁止），不用动；如果哪天被车机自动勾上了，要在这里关掉。
+
+```bash
+adb shell am start -n com.byd.appstartmanagement/.frame.AppStartManagement
+```
 
 **已知边界**：如果用户在最近任务里**上滑清掉**应用，DiLink 走的是 force-stop —— Android 会停止向 force-stop 的应用投递一切广播，`START_STICKY` 和网络 receiver 都不会生效，只能下次开机或手动打开应用恢复。这是平台行为，没有应用层的绕过方法（DiPlay 靠 USB 插入 / 蓝牙连接的 activity 拉起，纯热点场景没有对应入口）。正常使用（打开开关、不清后台）可以长期常驻。
 

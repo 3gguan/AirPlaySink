@@ -246,7 +246,6 @@
             android:lineSpacingExtra="2dp"
             android:padding="10dp"
             android:textColor="@color/sink_text_dim"
-            android:textIsSelectable="true"
             android:textSize="10sp" />
     </LinearLayout>
 </ScrollView>

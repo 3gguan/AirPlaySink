@@ -12,8 +12,10 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -65,6 +67,20 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     private var suppressSwitchCallback = false
     private var logRefreshScheduled = false
 
+    /**
+     * True while the page is parked at the bottom, meaning new log lines should be chased. Updated
+     * by the scroll listener only, never sampled at refresh time: once the user scrolls up the flag
+     * stays down until they come back to the bottom themselves, so a fresh line cannot pull the
+     * page out from under them.
+     */
+    private var followLogTail = true
+
+    /** True between a finger going down and lifting, so a refresh never fights a running drag. */
+    private var userDragging = false
+
+    /** True once the user taps the name field, so the window-focus handler stops clearing it. */
+    private var nameEditRequested = false
+
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (!granted) {
@@ -92,6 +108,24 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         nextButton = findViewById(R.id.nextButton)
 
         buildStatusRows()
+
+        // The on-screen log is the only thing that changes on its own, so it is also the only
+        // thing that could move the page while the user is reading. Two guards: a finger on the
+        // screen disables chasing outright, and the scroll position decides when chasing resumes.
+        rootScroll.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                // MOVE counts too: once the ScrollView takes over an intercepted drag the original
+                // DOWN went to a child, and this listener only starts seeing the stream here.
+                MotionEvent.ACTION_DOWN,
+                MotionEvent.ACTION_MOVE -> userDragging = true
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> userDragging = false
+            }
+            false
+        }
+        rootScroll.setOnScrollChangeListener { _, _, _, _, _ ->
+            followLogTail = isScrolledToBottom()
+        }
 
         serviceSwitch.setOnCheckedChangeListener { _, checked ->
             if (suppressSwitchCallback) return@setOnCheckedChangeListener
@@ -161,8 +195,52 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         super.onStart()
         SinkLog.listener = logListener
         SinkModel.addListener(this)
+        // Resume chasing only if the page is still parked at the bottom where the user left it.
+        followLogTail = isScrolledToBottom()
         renderLog()
         renderBatteryState()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // As soon as the window takes focus the framework focuses the only text-input view on the
+        // page, which would open the screen in edit mode with a blinking caret. Hand that focus
+        // back unless the user is the one who asked for the field.
+        if (!hasFocus || nameEditRequested) return
+        if (deviceNameInput.hasFocus()) deviceNameInput.clearFocus()
+    }
+
+    /**
+     * The name field is the only editable thing on the screen, so a tap anywhere else means "I am
+     * done editing": drop the focus and the keyboard with it. Without this the field keeps focus
+     * after the keyboard is dismissed and the caret goes on blinking over a page nobody is typing on.
+     */
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN && ::deviceNameInput.isInitialized) {
+            if (isInsideNameField(event.x, event.y)) {
+                nameEditRequested = true
+            } else if (deviceNameInput.hasFocus()) {
+                nameEditRequested = false
+                deviceNameInput.clearFocus()
+                hideKeyboard()
+            }
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
+    /** Both coordinates live in the window's space, which is the space dispatchTouchEvent gets. */
+    private fun isInsideNameField(x: Float, y: Float): Boolean {
+        val origin = IntArray(2)
+        deviceNameInput.getLocationInWindow(origin)
+        return x >= origin[0] &&
+            x <= origin[0] + deviceNameInput.width &&
+            y >= origin[1] &&
+            y <= origin[1] + deviceNameInput.height
+    }
+
+    private fun hideKeyboard() {
+        val input = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager ?: return
+        input.hideSoftInputFromWindow(deviceNameInput.windowToken, 0)
     }
 
     override fun onResume() {
@@ -326,17 +404,26 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         } else {
             all
         }
-        val followTail = isScrolledToBottom()
-        logText.text = if (tail.isEmpty()) {
+        val text = if (tail.isEmpty()) {
             getString(R.string.ui_log_empty)
         } else {
             tail.joinToString("\n")
         }
-        // Only chase the tail when the user has not scrolled up to read something.
-        if (followTail) rootScroll.post { rootScroll.fullScroll(View.FOCUS_DOWN) }
+        // Re-setting identical text would still cost a layout pass over the whole buffer, and each
+        // of those passes is a chance for the page to shift. Only touch the view for a real change.
+        if (text != logText.text?.toString()) logText.text = text
+        // Only chase the tail when the user is parked at the bottom and not dragging the page.
+        if (followLogTail && !userDragging) {
+            rootScroll.post {
+                if (followLogTail && !userDragging) rootScroll.fullScroll(View.FOCUS_DOWN)
+            }
+        }
     }
 
     private fun isScrolledToBottom(): Boolean {
+        // Before the first layout there is no answer: "unknown" must not be read as "at bottom",
+        // or the very first log line would drag the freshly opened page down to the log.
+        if (rootScroll.height == 0) return false
         val content = rootScroll.getChildAt(0) ?: return true
         return rootScroll.scrollY + rootScroll.height >= content.bottom - dp(24)
     }
@@ -347,9 +434,13 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
             toast(getString(R.string.ui_no_log_to_copy))
             return
         }
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        clipboard?.setPrimaryClip(ClipData.newPlainText(getString(R.string.ui_log), text))
+        copyToClipboard(getString(R.string.ui_log), text)
         toast(getString(R.string.ui_log_copied))
+    }
+
+    private fun copyToClipboard(label: String, text: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+        clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
     }
 
     // ------------------------------------------------------------------ remote control
@@ -405,6 +496,8 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         preferences.deviceName = deviceNameInput.text.toString()
         deviceNameInput.setText(preferences.deviceName)
         deviceNameInput.clearFocus()
+        nameEditRequested = false
+        hideKeyboard()
 
         if (!SinkService.isActive) {
             toast(getString(R.string.ui_name_saved))
@@ -441,11 +534,31 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         if (isIgnoringBatteryOptimizations()) return
         val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
             .setData(Uri.parse("package:$packageName"))
-        runCatching { startActivity(intent) }
-            .onFailure {
-                toast(getString(R.string.ui_battery_request_failed))
-                SinkLog.w("Battery exemption dialog unavailable: ${it.message}")
-            }
+
+        // Some head units register a placeholder for this action instead of a settings screen.
+        // BYD DiLink 3.0 (Android 10) answers with com.byd.systemsettings/.unsupport.UnsupportActivity,
+        // which flashes "多媒体系统不支持该操作" and closes — launching it is worse than doing nothing,
+        // because from the driver's seat it looks like the app broke. A resolver hit that is only
+        // such a stub is therefore refused and the adb command goes to the clipboard instead.
+        // A null resolver is NOT treated as a stub: package visibility on Android 11+ can hide
+        // the settings app from us even when the dialog would work, so that case still tries.
+        val handler = packageManager.resolveActivity(intent, 0)?.activityInfo?.name
+        if (handler != null && handler.contains("unsupport", ignoreCase = true)) {
+            SinkLog.w("Battery exemption dialog is a stub ($handler); copy adb command instead")
+            copyBatteryHint()
+            return
+        }
+
+        runCatching { startActivity(intent) }.onFailure {
+            SinkLog.w("Battery exemption dialog unavailable: ${it.message}")
+            copyBatteryHint()
+        }
+    }
+
+    /** The adb escape hatch, on the clipboard so it survives the trip to a terminal. */
+    private fun copyBatteryHint() {
+        copyToClipboard(getString(R.string.ui_battery), getString(R.string.ui_battery_adb_commands))
+        toast(getString(R.string.ui_battery_adb_copied))
     }
 
     // ------------------------------------------------------------------ plumbing
