@@ -100,6 +100,19 @@ class MdnsAdvertiser(
             serviceType = SERVICE_TYPE
             serviceName = requested
             this.port = port
+            // Naming the address is not cosmetic, it is the whole reason this receiver was visible to
+            // a phone on a hotspot. Left unset, the platform responder advertises *every* address the
+            // device owns, and the sender picks one for us: on a phone hotspot that pick lands on the
+            // global unicast address out of the phone's own cellular prefix, which the phone routes
+            // over the radio and therefore cannot use to reach us. It opens the connection, gets the
+            // SETUP answer, and abandons the session a millisecond later — measured 0 of 19, against
+            // 21 of 21 for the sessions that arrived over link-local or a router-assigned address.
+            // The advertised address has to be one both ends can reach, so pin it to the IPv4 the
+            // sender is already able to see.
+            // setHost rather than setHostAddresses: the latter is API 34 and this receiver has to run
+            // on the head unit's Android 10, where setHost is still the only way to name an address.
+            @Suppress("DEPRECATION")
+            setHost(config.localAddress)
             for ((key, value) in properties) setAttribute(key, value)
         }
 

@@ -65,6 +65,15 @@ class Ap2Advertiser(
             serviceType = SERVICE_TYPE
             serviceName = config.instanceName
             port = controlPort
+            // Same reason as the `_raop` record: an unset host makes the platform responder advertise
+            // every address on the device, and the sender picks — on a phone hotspot that pick is the
+            // global unicast address from the phone's own cellular prefix, which the phone routes over
+            // the radio and cannot use to reach us. iOS merges the `_airplay` and `_raop` records by
+            // device id, so both have to name the one address that is actually reachable.
+            // setHost rather than setHostAddresses: the latter is API 34 and this receiver has to run
+            // on the head unit's Android 10, where setHost is still the only way to name an address.
+            @Suppress("DEPRECATION")
+            setHost(config.localAddress)
             for ((key, value) in attributes) setAttribute(key, value)
         }
 

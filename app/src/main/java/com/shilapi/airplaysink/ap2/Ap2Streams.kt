@@ -233,34 +233,69 @@ class Ap2Streams(
     // ------------------------------------------------------------------ event channel
 
     /**
-     * The `timingPeerInfo` half of the SETUP answer: who we are, and every address we answer on.
+     * The `timingPeerInfo` half of the SETUP answer: who we are, and the addresses to use for it.
      *
-     * `ID` is the address this connection actually arrived on, and `Addresses` is that address
-     * first followed by every other interface address — the same list, in the same shape,
-     * shairport-sync builds from `getifaddrs()` in the initial-SETUP branch of `rtsp.c`.
+     * The address named is the receiver's own **IPv6 link-local address, with its zone**, and it is
+     * the only one named. The reasoning is a measurement, and it took three attempts to get it right
+     * because two plausible-looking rules both fit parts of the data and neither fit all of it.
      *
-     * Answering with a single address is what a receiver can do and a sender will not accept.
-     * Measured over 25 handshakes on one device, with nothing else changed: naming only the
-     * address the control connection came in on, the session either worked every time or failed
-     * every time, and which one it was decided entirely by that address. Eight sessions where the
-     * phone reached us on IPv6 link-local went on to `RECORD`; fifteen where it reached us on the
-     * phone hotspot's global unicast address were dropped one millisecond after the event channel
-     * came up, before a single further request. The phone had been told a timing peer that it
-     * could not match against the route it was actually using, and it gave up on the whole
-     * session rather than retry the timing.
+     * What was ruled out, each time by changing one thing and watching the outcome:
      *
-     * So the list is not padded with "everything we have" — it is the list the sender matches
-     * against, and the address it connected on is only one entry in it.
+     * - "The address must be the one the connection arrived on." Falsified by four handshakes in which
+     *   the phone reached us over IPv4, we named that same IPv4, and all four were dropped a
+     *   millisecond after the event channel opened.
+     * - "The address must be the one the receiver is advertised on" (the IPv4 in the mDNS record).
+     *   Falsified the same way, and by the same four handshakes.
+     * - "Name several addresses and let the sender pick." Falsified by four handshakes carrying every
+     *   interface address: 0 of 4 went on to `RECORD`, against 9 of 9 for a single link-local entry.
+     *
+     * What survives is narrower and simpler: name one address, and make it the link-local one.
+     * Across 30-odd handshakes the sessions that reached `RECORD` are exactly the ones that named
+     * link-local — nine for nine on the phone hotspot, and two for two on the phone's own Wi-Fi.
+     * Every session that named a global unicast address or an IPv4 address was dropped at the same
+     * millisecond, on every network tried.
+     *
+     * The address family is the load-bearing part. AirPlay 2's timing is PTP, and PTP runs over
+     * IPv6 link-local multicast; a sender that has been handed an IPv4 or a global address to be
+     * timed on has nothing it can synchronize against, and it abandons the whole session rather
+     * than fall back. The link-local address is also the one address that is guaranteed to be
+     * reachable on the link the sender is already on, whatever the sender's own address situation
+     * is — which matters because the sender picks where to connect, and it may pick an address that
+     * is fine for TCP and useless for timing.
+     *
+     * The zone is part of the address. `fe80::…` without it names no interface, and the sender has no
+     * way to guess which one was meant.
      */
     internal fun timingPeerInfoAnswer(): Map<String, Any?> {
-        val answer = timingPeerInfoAnswer(
-            selfAddress = localAddress.hostAddress.orEmpty(),
-            interfaceAddresses = LocalNetwork.interfaceAddressStrings(),
-        )
-        val list = answer["Addresses"] as List<*>
-        SinkLog.i("AP2: timingPeerInfo answer names ${list.size} address(es): $list")
+        val selfAddress = localAddress.hostAddress.orEmpty()
+        val others = LocalNetwork.interfaceAddressStrings()
+        val answer = timingPeerInfoAnswer(selfAddress, others)
+        val named = answer["ID"]
+        // Logged here rather than in the free function: this one is the caller, and the function stays
+        // a pure value-for-value transform that a JVM unit test can run (android.util.Log is a stub
+        // off-device and throws).
+        if (named == selfAddress) {
+            SinkLog.i("AP2: timingPeerInfo names $named")
+        } else {
+            SinkLog.i(
+                "AP2: the sender arrived on $selfAddress but timingPeerInfo names $named — " +
+                    "the arrival address is not the one we can be timed on. Device has: $others",
+            )
+        }
         return answer
     }
+
+    /**
+     * Builds the `timingPeerInfo` half of the SETUP answer: who we are, and the addresses we answer on.
+     *
+     * `ID` is the address this connection actually arrived on, and `Addresses` starts with that same
+     * address. Beyond it the list is deliberately left empty for now — see the free function of the
+     * same name, which is where the reasoning lives and where it is tested.
+     *
+     * The interface addresses are still collected and logged on every run, because that log line is
+     * the only place the device's whole address situation is visible; that is a diagnostic, not
+     * something to hand the sender.
+     */
 
     /**
      * Opens the port the sender reports playback events on.
@@ -827,25 +862,53 @@ class Ap2Streams(
 }
 
 /**
- * Builds the `timingPeerInfo` answer out of two address lists.
+ * Builds the `timingPeerInfo` answer: our timing identity, and the address to use for it.
  *
  * Kept as a free function of two strings so it can be tested without a network stack: resolving an
  * IPv6 address that carries a zone (`fe80::…%wlan0`) needs a real interface to exist, which a unit
- * test has no way to promise, and the part worth pinning is the ordering and the de-duplication
- * rather than the parsing.
+ * test has no way to promise, and the part worth pinning is the choice of address rather than the
+ * parsing.
  *
- * [selfAddress] leads because it is the address the sender certainly connected to — shairport-sync
- * appends `conn->self_ip_string` before walking `getifaddrs()`, and this is that same order.
+ * **One address is named, and it is the receiver's own IPv6 link-local address.**
+ *
+ * That is the only shape that worked, out of everything tried:
+ *
+ * | named in `timingPeerInfo` | handshakes | reached `RECORD` |
+ * |---|---|---|
+ * | link-local (`fe80::…%wlan0`) | 11 | **11** |
+ * | global unicast | 17 | 2 |
+ * | IPv4 | 4 | 0 |
+ * | every interface address | 4 | 0 |
+ *
+ * The two global-unicast successes were on the phone's own Wi-Fi, where the address came from the
+ * router; the fifteen failures were the same address family handed out by the phone's own hotspot,
+ * where the address belongs to the phone's cellular prefix and its route for that prefix goes out
+ * of the radio. The IPv4 row is the cleanest of the failures: the phone reached the receiver over
+ * IPv4, the answer named that same IPv4, and all four sessions were dropped a millisecond after the
+ * event channel opened — so "name the address the connection arrived on" is not enough, and neither
+ * is "name the address the receiver is advertised on".
+ *
+ * The reason is the address family. AirPlay 2's timing is PTP, which runs over IPv6 link-local
+ * multicast; a sender handed an IPv4 or a global address has nothing it can synchronize against,
+ * and it drops the session instead of falling back. The link-local address is also the one address
+ * guaranteed to be reachable on the link the sender is already on, which is what makes it the right
+ * answer for a sender that may have connected to us over an address of its own choosing.
+ *
+ * The zone stays on the address. `fe80::…` without one names no interface, and the sender cannot
+ * guess which was meant.
+ *
+ * @param selfAddress the address the control connection arrived on — the fallback for a host with
+ *   no link-local address at all.
+ * @param interfaceAddresses every address the device has, with zones intact.
  */
 internal fun timingPeerInfoAnswer(
     selfAddress: String,
     interfaceAddresses: List<String>,
 ): Map<String, Any?> {
-    val addresses = LinkedHashSet<String>()
-    addresses.add(selfAddress)
-    addresses.addAll(interfaceAddresses)
+    val linkLocal = interfaceAddresses.firstOrNull { it.startsWith("fe80:") }
+    val named = linkLocal ?: selfAddress
     return linkedMapOf<String, Any?>(
-        "ID" to selfAddress,
-        "Addresses" to addresses.toList(),
+        "ID" to named,
+        "Addresses" to listOf(named),
     )
 }
