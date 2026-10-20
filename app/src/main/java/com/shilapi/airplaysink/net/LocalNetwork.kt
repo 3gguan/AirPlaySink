@@ -97,7 +97,14 @@ object LocalNetwork {
      * uses it for PTP. Naming only the one address our control socket was accepted on was measured
      * to be the difference between connecting and being dropped — see [com.shilapi.airplaysink.ap2.Ap2Streams].
      *
-     * The connection's own address is not in here by construction: the caller puts that one first,
+     * shairport runs on hosts with one NIC, so its `getifaddrs()` walk only ever sees the one
+     * interface the sender is on. A phone is not that: it is usually *also* carrying a SIM, and
+     * `rmnet_ims*` hands out a global address on a different network entirely. Put one of those in
+     * the list and the sender tries to run timing over cellular, never gets an answer, and drops
+     * the session. So cellular — and every other interface that is not the link the receiver is
+     * actually reachable on — is left out here.
+     *
+     * The connection's own address is not filtered by construction: the caller puts that one first,
      * because it is the one the sender certainly wants, and it may be a scoped link-local address
      * this scan reports with its zone attached.
      */
@@ -107,10 +114,7 @@ object LocalNetwork {
         val out = LinkedHashSet<InetAddress>()
         for (networkInterface in interfaces) {
             if (!networkInterface.isUp || networkInterface.isLoopback) continue
-            val name = networkInterface.name.lowercase()
-            // Tethering mirrors of wlan0 repeat the same address under a different name; sending
-            // the duplicates costs bytes and tells the sender nothing new.
-            if (name.startsWith("p2p") || name.startsWith("dummy")) continue
+            if (!carriesAirPlay(networkInterface.name)) continue
             for (address in networkInterface.inetAddresses.toList()) {
                 if (address.isLoopbackAddress || address.isAnyLocalAddress) continue
                 out.add(address)
@@ -120,12 +124,30 @@ object LocalNetwork {
     }
 
     /**
+     * Whether this interface is one the sender could plausibly reach us on.
+     *
+     * Wi-Fi (including the hotspot the head unit runs itself), Ethernet and USB networking are in;
+     * cellular, VPN/tunnel and virtual bridges are out. A phone is multi-homed and the AirPlay link
+     * is only ever the Wi-Fi one — naming an address from another network is worse than naming
+     * none, because the sender will try it.
+     */
+    internal fun carriesAirPlay(interfaceName: String): Boolean {
+        val name = interfaceName.lowercase()
+        if (name.startsWith("rmnet") || name.startsWith("ccmni")) return false
+        if (name.startsWith("tun") || name.startsWith("ppp") || name.startsWith("ipsec")) return false
+        // Tethering mirrors and the dummy bridge repeat wlan0's addresses under other names.
+        if (name.startsWith("p2p") || name.startsWith("dummy")) return false
+        return true
+    }
+
+    /**
      * The string form of [allInterfaceAddresses], for the places that put addresses on the wire.
      *
      * A link-local address is only usable with its zone (`fe80::…%wlan0`), so the zone travels
      * with it — dropping it produces an address the sender cannot connect to at all.
      */
-    fun interfaceAddressStrings(): List<String> = allInterfaceAddresses().map { it.hostAddress }
+    fun interfaceAddressStrings(): List<String> =
+        allInterfaceAddresses().mapNotNull { it.hostAddress }
 
     /** Cheap SSID lookup for the status line; returns null when the platform hides it. */
     fun ssid(context: Context): String? {

@@ -5,20 +5,27 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * The `timingPeerInfo` answer to the initial SETUP, pinned on the rule that broke the car head unit.
+ * The `timingPeerInfo` answer to the initial SETUP.
  *
- * The symptom looked like a refusal and was not one: the phone connected, paired, opened the event
- * channel, and then closed the control connection about a millisecond later — before sending
- * anything at all. Nothing in our own log was wrong, so the only way to find it was to line up
- * every handshake in a long log against the address the phone had connected on. Twenty-five
- * handshakes, one device, one build: the eight where the phone arrived over IPv6 link-local went on
- * to `RECORD`, and the fifteen where it arrived over the phone hotspot's global unicast address
- * were all dropped at exactly that point. The only thing our reply varied between those two groups
- * was the single address it named.
+ * The symptom this file was written for looked like a refusal and was not one: the phone connected,
+ * paired, opened the event channel, and then closed the control connection about a millisecond later
+ * — before sending anything at all.
  *
- * The fix is to name every address, the way shairport-sync's `getifaddrs()` walk does. These tests
- * hold that in place, because the one-address version is smaller, reads tidier, and passes every
- * other test in the suite.
+ * What the log actually says, once every handshake in a long run is lined up against the address the
+ * phone arrived on: which address family it picked decided the outcome, *within one prefix*. Nine
+ * sessions where it arrived over IPv6 link-local all went on to `RECORD`; nineteen where it arrived
+ * over the phone hotspot's global unicast address were all dropped at exactly that point. But global
+ * unicast also worked — over a different prefix, earlier the same evening — so the address family
+ * is not the cause either, and neither is the reply's size, `ClockID`, or the FairPlay mode.
+ *
+ * So the rule these tests hold is narrower than "name more addresses". It is: name every address
+ * the sender could reach us on, and name nothing it could not. shairport-sync walks `getifaddrs()`
+ * and gets this right by accident, because the hosts it runs on have one interface. A phone is
+ * multi-homed — it is usually also carrying a SIM — and an address from the cellular network is
+ * worse than no address at all, because the sender will try to run timing over it.
+ *
+ * The one-address version is smaller, reads tidier, and passes every other test in the suite, so
+ * these are worth keeping.
  */
 class TimingPeerInfoTest {
 
