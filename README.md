@@ -254,6 +254,7 @@ classic 的请求上，一旦 iOS 按 AP2 协商，请求里就没有它们，�
 | 音量 | `SET_PARAMETER` 的 bplist `volume`（dB，与 RAOP 的 `volume:` 文本行同量纲） |
 | 事件通道 | 在 `Events-Salt` 密钥下应答；连上后立刻发一条 `updateInfo`；也用它向发送端发命令（见下一节） |
 | `FLUSHBUFFERED` | 发送端说「我丢掉了我缓冲的音频」，答 200 并把播放头移到新位置 |
+| `SETRATEANCHORTIME` | 发送端的时钟开关：`rate & 1` 为 1 才会播，为 0 就停，见下面的注 |
 | `POST /feedback` | 回 `{streams:[{type,sr}]}` 说明「正在播的是什么」，见下面的注 |
 | 反向控制 | 开关打开时发 `sendMediaRemoteCommand`，走事件通道 |
 
@@ -290,6 +291,18 @@ classic 的请求上，一旦 iOS 按 AP2 协商，请求里就没有它们，�
 > 现在端点先经 `util/SeqNo.narrow()` 窄化，比较用**模 23 算术**（`SeqNo.difference()`，按 bit22
 > 符号位解释），所以计数器回绕时也不会把「刚发的旧包」误判成「端点之后的新包」。
 > 单测 `SeqNoTest` 钉住窄化、端点前后边界、回绕与对称性。
+>
+> 第四个坑：**`SETRATEANCHORTIME` 是唯一的播放/暂停信号**。AirPlay 2 会话**一个 sync 包都不发**，
+> 所以「发送端认为自己在不在播」这件事，只有这个请求会说——shairport-sync 的
+> `handle_setrateanchortime` 只读一个位：`rate & 1` 为 1 才把 `ap2_play_enabled` 置 1 并通知 PTP
+> 「B」eginning，为 0 就复位锚点。本机以前答 200 之后就把 body 扔了（动词落进兜底分支），
+> 于是**整个暂停期间管线一直在播**。症状很有迷惑性：每次暂停后约 150 ms 就跟一个
+> `FLUSHBUFFERED`，把队列和喇叭清空，而管线继续往这个空余量里灌码，500 ms 的余量直接塌到 1 ms，
+> 触发 `Cushion down to 21ms; refilling`——真机两分钟里 14 次 underrun，全部落在暂停窗口内，
+> 听感就是**每拖一次进度条就缺一段**。现在按 `rate & 1` 驱动 `AudioPipeline.setPlayEnabled()`：
+> 停表时连 `flushStale`/`flush` 里的 `track.play()` 都不再执行（否则会把刚停下的喇叭又叫醒），
+> 队列照常收包；起表时清掉 `primed`，先补够余量再出声。
+> 单测 `SetRateAnchorTest` 钉住这一位（包括高位是时间线标识符、负数仍读 bit 0）。
 
 刻意没做：PTP 时钟同步（本机自己走自己的时钟，不参与多房间对齐）、
 HomeKit / `/pair-verify`（transient 配对够用，也不需要 Ed25519 身份）。
@@ -630,6 +643,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | **按暂停有效，再按播放没反应（音乐不回来）** | 症状是「播放」按下去状态卡还停在「已就绪」但手机不理。看日志里暂停那一刻有没有 `AP2: TEARDOWN plist: {streams:[…]}` 紧跟 `AP2: audio stream stopped; the session and its event channel stay up` —— 有就是对的路径（流停了、会话还在）。如果日志是 `AP2: TEARDOWN — the session ends here` 或 `TEARDOWN received; closing the session`，说明这条被当成会话结束处理了，控制连接随之消失，后续按键全部落在 `protocol=null` 上。 |
 | **Apple Music 在 AirPlay 2 下不播（连上后点播放毫无反应；切到 AirPlay 1 又正常）** | 先分清是哪一种，日志会直接给出：**① 有 `AP2: SETUP (streams)` / `First audio packet received`，但几秒后 `AP2: TEARDOWN`** → 流被手机自己撤了，看 `POST /feedback` 那几行是不是空应答（正确应答是 `AP2: /feedback — playing stream type 96 at 44100 Hz; saying so`）。② **通篇没有 `SETUP (streams)`**（只有 `RECORD — session open` 和每 2 s 一次的 `/feedback`）→ 手机压根不愿意建流，`/feedback` 与它无关，看 `/info` 能力表和事件通道：`supportedFormats.bufferStream` 必须带 AAC-LC 位（`0xC40000`，否则 Apple Music 判本机没法放），并且事件通道连上后要发 `updateInfo`（日志 `AP2: updateInfo posted on the event channel -> SENT`）。这条查询只有 AirPlay 2 的会话会发，AP1 从来不暴露这些问题。 |
 | **AirPlay 2 下按上一首 / 播放暂停 / 下一首音乐直接停了** | 先看日志结尾：如果是 `AP2: events <- command reply RTSP/1.0 200` 之后才断，那是手机随后自己结束了会话（它在切歌/暂停，不是报错）。如果是 `AP2: sender closed the encrypted channel without sending a frame` 紧跟 `The sender closed the control stream`，那是事件通道的加密帧手机解不开——检查 `ChannelKeys.EVENTS` 是不是被“顺手统一”成了 control 的镜像（写 `Events-Read…`）。这正是本机踩过的坑。 |
+| **拖一次进度条就缺一段音频（每次 seek 都听到一个坑）** | 这是暂停窗口被当成了播放。AirPlay 2 **不发 sync 包**，「发送端在不在播」只有 `SETRATEANCHORTIME` 的 `rate` 字段说了算（`rate & 1` 为 1 才播）。看日志里每次暂停有没有 `AP2: SETRATEANCHORTIME rate=0 — the sender's clock is stopped` 和对应的 `rate=1 … running`；缺了 `rate=0` 那一行说明这个请求落进了兜底分支，答了 200 却没看 body，管线于是在暂停期间照播不误。伴随症状是 `Cushion down to 21ms; refilling` 和 `underruns` 上涨。当前版本已在 `RaopSession.setRateAnchorTime()` 里驱动 `AudioPipeline.setPlayEnabled()`，单测 `SetRateAnchorTest` 钉住这一位。 |
 | AP2 下按了按钮，状态卡停在「已送出 · 等手机应答」 | 手机收下了但没回话，或回话到了但事件通道已断。看日志有没有 `AP2: events <- command reply`；没有就去确认 `ap2Remote=true`、`event channel up` 两行都在。 |
 | **AP2 拖进度条之后整条音频流哑了**（统计行不再出现） | 统计行 `received N packets, …` 在 `FLUSHBUFFERED` 之后**彻底消失**，说明之后的包全被当成过时数据丢掉了。根因是端点宽度不匹配：音频块的计数器只有 23 位，而 `flushUntilSeq` 是 32 位，比较前必须先 `& 0x7fffff` 窄化（shairport-sync 的 `handle_flushbuffered()` 就是这么做的），并用模 23 算术比较。当前版本已在 `util/SeqNo.kt` 处理；日志会打出 `endpoint 10299533 narrowed to 1910925` 供核对。若这行缺失或窄化值可疑，说明回到旧逻辑了。 |
 | 「反向控制」一直是"等待 iPhone 提供"，点按钮没反应 | 说明 `_dacp._tcp` 没解析出来。先确认没在 AP2 会话里（状态卡「当前协议」）；再看日志有没有 `Remote control offered: DACP-ID=... Active-Remote=...`（有 = iPhone 确实把凭据给了）；再看有没有 `DACP: "iTunes_Ctrl_..." at ...:port`（有 = 端口解析成功）。只有前者没有后者 → mDNS 应答被拦，或这台 iPhone 没广播这个服务 |

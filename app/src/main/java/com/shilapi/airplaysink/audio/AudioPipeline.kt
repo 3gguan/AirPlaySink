@@ -348,6 +348,64 @@ class AudioPipeline(
      */
     private var primed = false
 
+    /**
+     * Whether the sender's clock is running, which is the only thing that says whether *we* should
+     * be playing.
+     *
+     * An AirPlay 2 sender announces this in `SETRATEANCHORTIME`: bit 0 of `rate` set means the
+     * clock is running (shairport-sync sends it the PTP "B"eginning control message and calls it
+     * `ap2_play_enabled = 1`), clear means it is stopped. AirPlay 2 sends no sync packets at all, so
+     * this is the *only* play/pause signal that exists — answering 200 and ignoring `rate` leaves
+     * the pipeline playing through every pause and every seek.
+     *
+     * The damage is not subtle. Each pause is followed within ~150 ms by a `FLUSHBUFFERED`, which
+     * empties the queue and the AudioTrack; the pipeline then keeps writing packets into that
+     * emptied cushion as fast as they decode, so the speaker is handed silence while it waits for
+     * the sender to restart — the cushion falls from 500 ms to 1 ms, `Cushion down to 21ms;
+     * refilling` fires, and every one of those is an audible gap. Measured over a two-minute
+     * session of seeking: 14 underruns, all of them inside a pause window.
+     *
+     * True by default: a session that never sends `SETRATEANCHORTIME` (every classic RAOP sender)
+     * must keep playing exactly as before.
+     */
+    @Volatile
+    private var playEnabled = true
+
+    /**
+     * Called when the sender starts or stops its clock.
+     *
+     * Stopping drops what is already in the speaker rather than letting it finish: the audio in the
+     * track belongs to the position the sender is leaving, so playing it out is exactly the old
+     * track bleeding past the pause. Starting does not resume writing straight away — [primed] is
+     * cleared so the loop first rebuilds a cushion, which is what keeps the pause from turning into
+     * a dropout.
+     */
+    fun setPlayEnabled(enabled: Boolean) {
+        if (playEnabled == enabled) return
+        playEnabled = enabled
+        if (enabled) {
+            synchronized(lock) {
+                primed = false
+                firstPacketAt = 0L
+                lock.notifyAll()
+            }
+            fadeInFrames = START_FADE_IN_FRAMES
+            lastFrameShorts = 0
+            java.util.Arrays.fill(lastSamples, 0)
+            runCatching { track?.play() }
+            SinkLog.i("Audio output resumed — the sender restarted its clock; rebuilding the cushion")
+        } else {
+            runCatching { track?.pause() }
+            runCatching { track?.flush() }
+            synchronized(lock) {
+                writtenFrames = 0L
+                headBaseFrames = currentHeadFrames()
+                lock.notifyAll()
+            }
+            SinkLog.i("Audio output paused — the sender stopped its clock")
+        }
+    }
+
     /** Reported on the decode thread; the UI must post to the main thread itself. */
     var onStats: ((String) -> Unit)? = null
 
@@ -543,7 +601,10 @@ class AudioPipeline(
         runCatching {
             track?.pause()
             track?.flush()
-            track?.play()
+            // Only restart the speaker if the sender's clock is still running. A flush that lands
+            // inside a pause window (which is where they land — ~150 ms apart) must leave it
+            // stopped, or the loop below starts writing again the moment it is next reached.
+            if (playEnabled) track?.play()
         }
         synchronized(lock) {
             writtenFrames = 0L
@@ -576,7 +637,7 @@ class AudioPipeline(
         runCatching {
             track?.pause()
             track?.flush()
-            track?.play()
+            if (playEnabled) track?.play()
         }
         synchronized(lock) {
             // Everything queued was just thrown away, so the playback head restarts: re-anchor the
@@ -696,6 +757,14 @@ class AudioPipeline(
 
         val out = pcm
         while (running) {
+            // While the sender's clock is stopped we must not write: the packets still arriving
+            // belong to the position it is leaving, and the AudioTrack has just been emptied. The
+            // queue keeps filling (bounded by [MAX_PENDING_PACKETS]) so that the moment the clock
+            // restarts there is a cushion to play from.
+            if (!playEnabled) {
+                synchronized(lock) { waitLocked(50) }
+                continue
+            }
             var payload: ByteArray? = null
             synchronized(lock) {
                 if (pending.isEmpty()) {

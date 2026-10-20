@@ -349,6 +349,7 @@ class RaopSession(
             "SET_PARAMETER" -> respond(request, setParameterResponse(request))
             "GET_PARAMETER" -> respond(request, getParameterResponse(request))
             "FLUSH" -> respond(request, flushResponse())
+            "SETRATEANCHORTIME" -> respond(request, setRateAnchorTime(request))
             "TEARDOWN" -> {
                 respond(request, RtspResponse(200).addHeader("Connection", "close"))
                 SinkLog.i("TEARDOWN received; closing the session")
@@ -539,6 +540,55 @@ class RaopSession(
                 "; the playhead moves to the new position" +
                 (if (rawUntil != untilSeq) " (endpoint $rawUntil narrowed to $untilSeq)" else ""),
         )
+    }
+
+    /**
+     * The sender's play/pause clock, and the anchor that goes with it.
+     *
+     * shairport-sync's `handle_setrateanchortime` reads one bit out of this: `rate & 1` set means
+     * the clock is running, and only then does it set `conn->ap2_play_enabled = 1` and send PTP its
+     * "B"eginning message. Clear means the clock is stopped and it resets the anchor.
+     *
+     * Answering 200 and throwing the body away — which is what this did, because the verb reached
+     * the catch-all handler — leaves the pipeline playing through the whole of every pause. An
+     * AirPlay 2 sender emits no sync packets at all, so this message is the *only* statement any
+     * receiver gets about whether the sender thinks it is playing. Each pause is followed about
+     * 150 ms later by a `FLUSHBUFFERED`, which empties the queue and the speaker; the loop then
+     * writes into that empty cushion until it has nothing left, so the cushion collapses from
+     * 500 ms to 1 ms and every pause becomes an audible dropout (measured: 14 underruns in a
+     * two-minute session, `Cushion down to 21ms; refilling` twice).
+     *
+     * The `rate:1` form also carries the only timing anchor an AirPlay 2 session ever supplies —
+     * `rtpTime` is the frame sounding at the given network time — so it is worth reading, though
+     * without PTP discipline the anchor can only be taken at face value.
+     */
+    private fun setRateAnchorTime(request: RtspRequest): RtspResponse {
+        val plist = safePlist(request.content) as? Map<*, *>
+        val rate = (plist?.get("rate") as? Number)?.toLong()
+        if (rate == null) {
+            SinkLog.w("AP2: SETRATEANCHORTIME without a rate; leaving playback as it was")
+            return RtspResponse(200)
+        }
+        // Bit 0 is the clock's run state. The rest of `rate` is a timeline identifier we have no
+        // use for: shairport keeps it, but only this bit changes what the receiver does.
+        val running = setRateAnchorRunsClock(rate)
+        val rtpTime = (plist?.get("rtpTime") as? Number)?.toLong()
+        if (running) {
+            // The frame named here is the one sounding at the sender's `networkTime*` instant.
+            // Taking that instant as "now" is the best available reading of the anchor; PTP
+            // discipline would be needed to do better, and the sender's own latency compensation
+            // is not available either, so this only has to be close enough to pace against.
+            if (rtpTime != null) {
+                pipeline?.setTimingAnchor(rtpTime, System.nanoTime())
+            }
+        }
+        pipeline?.setPlayEnabled(running)
+        SinkLog.i(
+            "AP2: SETRATEANCHORTIME rate=$rate — the sender's clock is " +
+                (if (running) "running" else "stopped") +
+                (if (running && rtpTime != null) ", anchored at rtp time $rtpTime" else ""),
+        )
+        return RtspResponse(200)
     }
 
     /**
@@ -1152,6 +1202,19 @@ class RaopSession(
         sessionKey = null
     }
 }
+
+/**
+ * Whether an AirPlay 2 `SETRATEANCHORTIME` says the sender's clock is running.
+ *
+ * shairport-sync's `handle_setrateanchortime` reads exactly one bit: `rate & 1` set means the clock
+ * runs, and only then does it set `conn->ap2_play_enabled = 1` and tell PTP the clock is "B"eginning.
+ * Clear means stopped, and it resets the anchor.
+ *
+ * A free function so a unit test can pin it without a socket. Getting this backwards is silent and
+ * expensive: a receiver that treats a pause as a play keeps writing into the cushion the paired
+ * `FLUSHBUFFERED` just emptied, which is audible as a dropout on every seek.
+ */
+internal fun setRateAnchorRunsClock(rate: Long): Boolean = (rate and 1L) != 0L
 
 /**
  * Whether an AirPlay 2 `TEARDOWN` body is aimed at the audio stream rather than the session.
