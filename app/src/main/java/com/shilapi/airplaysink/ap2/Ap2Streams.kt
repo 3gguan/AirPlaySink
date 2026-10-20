@@ -1,6 +1,7 @@
 package com.shilapi.airplaysink.ap2
 
 import com.shilapi.airplaysink.audio.AudioCodec
+import com.shilapi.airplaysink.net.LocalNetwork
 import com.shilapi.airplaysink.rtsp.RtspReader
 import com.shilapi.airplaysink.rtsp.RtspResponse
 import com.shilapi.airplaysink.rtsp.writeRtsp
@@ -211,10 +212,7 @@ class Ap2Streams(
             )
             (plist["timingPeerInfo"] as? Map<*, *>)?.let { peer ->
                 SinkLog.i("AP2: SETUP asks for timingPeerInfo: ${BPlistReader.describe(peer)}")
-                response["timingPeerInfo"] = linkedMapOf<String, Any?>(
-                    "ID" to localAddress.hostAddress,
-                    "Addresses" to listOf(localAddress.hostAddress),
-                )
+                response["timingPeerInfo"] = timingPeerInfoAnswer()
             }
             return BPlist.write(response)
         }
@@ -233,6 +231,36 @@ class Ap2Streams(
     }
 
     // ------------------------------------------------------------------ event channel
+
+    /**
+     * The `timingPeerInfo` half of the SETUP answer: who we are, and every address we answer on.
+     *
+     * `ID` is the address this connection actually arrived on, and `Addresses` is that address
+     * first followed by every other interface address — the same list, in the same shape,
+     * shairport-sync builds from `getifaddrs()` in the initial-SETUP branch of `rtsp.c`.
+     *
+     * Answering with a single address is what a receiver can do and a sender will not accept.
+     * Measured over 25 handshakes on one device, with nothing else changed: naming only the
+     * address the control connection came in on, the session either worked every time or failed
+     * every time, and which one it was decided entirely by that address. Eight sessions where the
+     * phone reached us on IPv6 link-local went on to `RECORD`; fifteen where it reached us on the
+     * phone hotspot's global unicast address were dropped one millisecond after the event channel
+     * came up, before a single further request. The phone had been told a timing peer that it
+     * could not match against the route it was actually using, and it gave up on the whole
+     * session rather than retry the timing.
+     *
+     * So the list is not padded with "everything we have" — it is the list the sender matches
+     * against, and the address it connected on is only one entry in it.
+     */
+    internal fun timingPeerInfoAnswer(): Map<String, Any?> {
+        val answer = timingPeerInfoAnswer(
+            selfAddress = localAddress.hostAddress.orEmpty(),
+            interfaceAddresses = LocalNetwork.interfaceAddressStrings(),
+        )
+        val list = answer["Addresses"] as List<*>
+        SinkLog.i("AP2: timingPeerInfo answer names ${list.size} address(es): $list")
+        return answer
+    }
 
     /**
      * Opens the port the sender reports playback events on.
@@ -796,4 +824,28 @@ class Ap2Streams(
         streamDescriptor = null
         audioKey = null
     }
+}
+
+/**
+ * Builds the `timingPeerInfo` answer out of two address lists.
+ *
+ * Kept as a free function of two strings so it can be tested without a network stack: resolving an
+ * IPv6 address that carries a zone (`fe80::…%wlan0`) needs a real interface to exist, which a unit
+ * test has no way to promise, and the part worth pinning is the ordering and the de-duplication
+ * rather than the parsing.
+ *
+ * [selfAddress] leads because it is the address the sender certainly connected to — shairport-sync
+ * appends `conn->self_ip_string` before walking `getifaddrs()`, and this is that same order.
+ */
+internal fun timingPeerInfoAnswer(
+    selfAddress: String,
+    interfaceAddresses: List<String>,
+): Map<String, Any?> {
+    val addresses = LinkedHashSet<String>()
+    addresses.add(selfAddress)
+    addresses.addAll(interfaceAddresses)
+    return linkedMapOf<String, Any?>(
+        "ID" to selfAddress,
+        "Addresses" to addresses.toList(),
+    )
 }

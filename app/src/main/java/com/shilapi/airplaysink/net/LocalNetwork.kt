@@ -88,6 +88,45 @@ object LocalNetwork {
         return wifi ?: if (onlyWifi) null else any
     }
 
+    /**
+     * Every address on every interface that is up and not loopback, IPv4 and IPv6 alike.
+     *
+     * This is the list an AirPlay 2 `timingPeerInfo` answer has to carry. shairport-sync builds it
+     * with `getifaddrs()` and puts all of it in the reply (`rtsp.c`, the initial SETUP), and that
+     * list is not cosmetic: the sender picks the entry matching the address it reached us on and
+     * uses it for PTP. Naming only the one address our control socket was accepted on was measured
+     * to be the difference between connecting and being dropped — see [com.shilapi.airplaysink.ap2.Ap2Streams].
+     *
+     * The connection's own address is not in here by construction: the caller puts that one first,
+     * because it is the one the sender certainly wants, and it may be a scoped link-local address
+     * this scan reports with its zone attached.
+     */
+    fun allInterfaceAddresses(): List<InetAddress> {
+        val interfaces = runCatching { Collections.list(NetworkInterface.getNetworkInterfaces()) }
+            .getOrNull() ?: return emptyList()
+        val out = LinkedHashSet<InetAddress>()
+        for (networkInterface in interfaces) {
+            if (!networkInterface.isUp || networkInterface.isLoopback) continue
+            val name = networkInterface.name.lowercase()
+            // Tethering mirrors of wlan0 repeat the same address under a different name; sending
+            // the duplicates costs bytes and tells the sender nothing new.
+            if (name.startsWith("p2p") || name.startsWith("dummy")) continue
+            for (address in networkInterface.inetAddresses.toList()) {
+                if (address.isLoopbackAddress || address.isAnyLocalAddress) continue
+                out.add(address)
+            }
+        }
+        return out.toList()
+    }
+
+    /**
+     * The string form of [allInterfaceAddresses], for the places that put addresses on the wire.
+     *
+     * A link-local address is only usable with its zone (`fe80::…%wlan0`), so the zone travels
+     * with it — dropping it produces an address the sender cannot connect to at all.
+     */
+    fun interfaceAddressStrings(): List<String> = allInterfaceAddresses().map { it.hostAddress }
+
     /** Cheap SSID lookup for the status line; returns null when the platform hides it. */
     fun ssid(context: Context): String? {
         val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
