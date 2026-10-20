@@ -57,6 +57,20 @@ class DacpClient(
         STOP("stop"),
         NEXT("nextitem"),
         PREVIOUS("previtem"),
+
+        /*
+         * Seeking, as a scan that has to be started and stopped. DACP spells the start `beginrew` /
+         * `beginff` and has no endpoint at all for the stop (shairport-sync's command table leaves
+         * both stop slots NULL), which is why AirPlay 1 refuses all four: leaving a phone scanning
+         * with no way to stop it is worse than not scanning. AirPlay 2 has the stop commands, so
+         * that is the only protocol this receiver sends them on.
+         *
+         * The `path` of the two stop entries is never used — there is no DACP endpoint behind it.
+         */
+        SEEK_BACKWARD("beginrew"),
+        SEEK_FORWARD("beginff"),
+        SEEK_BACKWARD_STOP("endrew"),
+        SEEK_FORWARD_STOP("endff"),
     }
 
     private companion object {

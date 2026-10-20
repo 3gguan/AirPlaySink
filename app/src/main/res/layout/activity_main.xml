@@ -120,6 +120,15 @@
                 android:text="@string/ui_control_next" />
         </LinearLayout>
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:lineSpacingExtra="2dp"
+            android:text="@string/ui_seek_hint"
+            android:textColor="@color/sink_text_dim"
+            android:textSize="12sp" />
+
         <androidx.appcompat.widget.SwitchCompat
             android:id="@+id/bootSwitch"
             android:layout_width="match_parent"

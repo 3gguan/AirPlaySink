@@ -6,6 +6,7 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Process
 import android.os.SystemClock
+import com.shilapi.airplaysink.util.SeqNo
 import com.shilapi.airplaysink.util.SinkLog
 import java.io.Closeable
 
@@ -35,6 +36,15 @@ class AudioPipeline(
      * bigger number and will sound late by exactly as much.
      */
     private val cushionMs: Int = TARGET_CUSHION_MS.toInt(),
+    /**
+     * Which codec the packets are in.
+     *
+     * AirPlay 1 only ever sends ALAC, and so does an AirPlay 2 session from most third-party apps.
+     * Apple Music does not: it asks for AAC-LC at 48 kHz in the `SETUP`, and the difference is not
+     * a detail — feeding AAC to the ALAC decoder rejects nearly every frame and turns the few that
+     * slip through into noise, with no other symptom to go on.
+     */
+    private val codec: AudioCodec = AudioCodec.ALAC,
 ) : Closeable {
 
     private companion object {
@@ -178,6 +188,25 @@ class AudioPipeline(
          * enough that a mis-anchor degrades to a brief hesitation rather than a dead speaker.
          */
         const val MAX_PACE_WAIT_MS = 200L
+
+        /**
+         * How many decode failures are described in the log before going quiet.
+         *
+         * A codec mismatch fails on every single packet — the sound of it is unmistakable, but a
+         * warning per packet buries everything else in the file, and the stats line still carries
+         * the count.
+         */
+        const val MAX_DECODE_FAILURE_LOGS = 10
+
+        /**
+         * How far the sequence may jump before it stops looking like a loss.
+         *
+         * A lost packet is a hole of one or two, occasionally a few dozen when the link is bad.
+         * A jump of thousands is the sender having moved somewhere else in the track, and the
+         * old packets are never coming — at 1024 frames a packet this is over half a minute of
+         * audio, which no network hiccup produces.
+         */
+        const val TIMELINE_RESYNC_PACKETS = 1000L
     }
 
     /** The cushion, in frames — also the amount of pre-buffer playback waits for. */
@@ -200,15 +229,28 @@ class AudioPipeline(
     private val prebufferPackets =
         (targetCushionFrames / framesPerPacket).toInt().coerceAtLeast(2)
 
-    private val decoder = AlacDecoder(
-        sampleSize = 16,
-        numChannels = channels,
-        maxSamplesPerFrame = framesPerPacket,
-    )
+    private val decoder: AudioDecoder = when (codec) {
+        AudioCodec.ALAC -> AlacDecoder(
+            sampleSize = 16,
+            numChannels = channels,
+            maxSamplesPerFrame = framesPerPacket,
+        )
 
-    // Stereo is the floor even if the sender announced mono: a CPE element always produces two
-    // interleaved channels, and a short output array would throw on the decode thread.
-    private val pcm = ShortArray(framesPerPacket * maxOf(2, channels))
+        AudioCodec.AAC -> AacDecoder(
+            sampleRate = sampleRate,
+            channels = channels,
+            maxFramesPerPacket = framesPerPacket,
+        )
+    }
+
+    /**
+     * One packet's worth of PCM, sized by the decoder rather than by the sender's `spf`.
+     *
+     * They are the same number whenever the sender is telling the truth, but an under-sized buffer
+     * is a decode that throws on the audio thread, so the decoder gets the final say.
+     */
+    private val pcmFrames = maxOf(framesPerPacket, decoder.maxFramesPerPacket)
+    private val pcm = ShortArray(pcmFrames * maxOf(2, channels))
     private val pending = java.util.TreeMap<Long, ByteArray>()
     private val lock = Object()
 
@@ -223,6 +265,9 @@ class AudioPipeline(
     private var decodedPackets = 0L
     private var receivedPackets = 0L
     private var skippedPackets = 0L
+
+    /** How many failed decodes have been described in the log so far; see [MAX_DECODE_FAILURE_LOGS]. */
+    private var decodeFailures = 0
 
     /** The RTP timestamp carried by the first packet, and its sequence — the timeline anchor. */
     private var firstRtpSequence = -1L
@@ -259,7 +304,7 @@ class AudioPipeline(
     private var pendingConceal = 0
 
     /** The last frame that decoded cleanly, in interleaved shorts — what a stand-in imitates. */
-    private val lastFrame = ShortArray(framesPerPacket * maxOf(2, channels))
+    private val lastFrame = ShortArray(pcmFrames * maxOf(2, channels))
     private var lastFrameShorts = 0
 
     /** The last sample handed to the AudioTrack, per channel: where a stand-in has to begin. */
@@ -274,7 +319,7 @@ class AudioPipeline(
     @Volatile
     private var fadeInFrames = 0
 
-    private val concealBuffer = ShortArray(framesPerPacket * maxOf(2, channels))
+    private val concealBuffer = ShortArray(pcmFrames * maxOf(2, channels))
     private var concealedPackets = 0L
     private var rebufferCount = 0L
 
@@ -358,7 +403,7 @@ class AudioPipeline(
         ).also { it.play() }
 
         SinkLog.i(
-            "Audio output started: ${sampleRate}Hz ${channels}ch, " +
+            "Audio output started: ${codec.label} ${sampleRate}Hz ${channels}ch, " +
                 "AudioTrack buffer ${bufferSize} bytes (min ${minBuffer}); " +
                 "cushion target ${cushionMs}ms = $prebufferPackets packets of pre-buffer, " +
                 "starting if nothing better arrives within ${prebufferTimeoutMs}ms",
@@ -375,6 +420,34 @@ class AudioPipeline(
     fun submit(sequence: Long, rtpTime: Long, payload: ByteArray) {
         synchronized(lock) {
             receivedPackets++
+            // The sender's own word that this audio is stale — it is discarding what it had
+            // buffered, usually because the listener seeked. Such a packet is not late, it is
+            // unwanted: playing it would put the old track back on top of the new one.
+            //
+            // The comparison is modular rather than plain, because the counter is 23 bits wide and
+            // wraps: a packet that is *behind* the endpoint can carry the larger number once the
+            // wrap is crossed, and treating it as "past the endpoint" would start playing the
+            // stale backlog all over again. [SeqNo.difference] is the same arithmetic
+            // shairport-sync uses.
+            val from = staleFrom
+            val until = staleUntil
+            if (until >= 0L) {
+                val pastEndpoint = SeqNo.difference(sequence, until) >= 0L
+                val unwanted = if (from < 0L) {
+                    !pastEndpoint
+                } else {
+                    SeqNo.difference(sequence, from) >= 0L && !pastEndpoint
+                }
+                if (unwanted) {
+                    flushedPackets++
+                    return
+                }
+                if (pastEndpoint) {
+                    // Past the endpoint: the flush is over and the new timeline has begun.
+                    staleFrom = -1L
+                    staleUntil = -1L
+                }
+            }
             if (nextSequence >= 0L && sequence < nextSequence) {
                 // Its moment has already been played, so there is nowhere to put it. Counted
                 // rather than stored: see [tooLatePackets].
@@ -388,8 +461,20 @@ class AudioPipeline(
                 return
             }
             if (pending.size >= MAX_PENDING_PACKETS) {
-                pending.pollFirstEntry()
-                skippedPackets++
+                // The queue is full: the sender is further ahead of us than we can hold. The
+                // oldest entry is the one the playhead is about to ask for, so dropping it would
+                // leave a hole exactly where the decode loop is waiting — and the wait for a hole
+                // that can no longer be filled is [gapWaitMs] long. Drop it and move the playhead
+                // to what is left: the audio in front of the playhead is stale by definition
+                // anyway, and the sender keeps pushing.
+                val dropped = pending.pollFirstEntry()
+                if (dropped != null) {
+                    skippedPackets++
+                    if (dropped.key <= nextSequence && pending.isNotEmpty()) {
+                        nextSequence = pending.firstKey()
+                        gapSince = 0L
+                    }
+                }
             }
             pending[sequence] = payload
             // Record the RTP timestamp of the first packet: every later packet's timestamp is this
@@ -407,6 +492,72 @@ class AudioPipeline(
         }
     }
 
+    /**
+     * The sender's word that a stretch of audio is stale and must not be played.
+     *
+     * A negative [staleFrom] means "everything up to [staleUntil]"; otherwise the range
+     * `[staleFrom, staleUntil]` is the stale one. Set by [flushStale] and cleared by itself once
+     * a packet beyond the endpoint turns up.
+     */
+    @Volatile
+    private var staleFrom = -1L
+
+    @Volatile
+    private var staleUntil = -1L
+
+    /** How many packets were dropped because the sender said they were stale. */
+    private var flushedPackets = 0L
+
+    /**
+     * Drops the audio the sender says is stale, and starts a fresh timeline.
+     *
+     * AirPlay 2's buffered stream lets the phone throw away what it has buffered — after a seek,
+     * or when the backlog is too old to be worth sending. It says so with `FLUSHBUFFERED`, naming
+     * the sequence number the flush runs to.
+     *
+     * Not answering that request is not a small omission. The phone carries on from the new
+     * position, so every packet it sends after the flush has a sequence number thousands ahead of
+     * where the playhead is: the pipeline sees a hole that will never be filled, waits for it,
+     * gives up, and books thousands of packets as lost. The measured symptom was `skipped 20028`
+     * and an audio track that slowed to a crawl. Worse, the old position kept playing until the
+     * playhead caught up — a seek that does not seek.
+     *
+     * So the flush is answered in two halves: what is already queued goes now, and what is still
+     * on the wire up to the endpoint is dropped as it arrives ([submit]).
+     *
+     * @param fromSeq the first stale sequence, or -1 for "everything up to [untilSeq]".
+     */
+    fun flushStale(fromSeq: Long, untilSeq: Long) {
+        synchronized(lock) {
+            pending.clear()
+            nextSequence = -1L
+            firstRtpSequence = -1L
+            firstRtpTime = 0L
+            gapSince = 0L
+            pendingConceal = 0
+            staleFrom = fromSeq
+            staleUntil = untilSeq
+            lock.notifyAll()
+        }
+        // Whatever is already in the speaker belongs to the old position too.
+        runCatching {
+            track?.pause()
+            track?.flush()
+            track?.play()
+        }
+        synchronized(lock) {
+            writtenFrames = 0L
+            headBaseFrames = currentHeadFrames()
+        }
+        lastFrameShorts = 0
+        java.util.Arrays.fill(lastSamples, 0)
+        fadeInFrames = START_FADE_IN_FRAMES
+        SinkLog.i(
+            "Audio pipeline flushed up to sequence $untilSeq" +
+                (if (fromSeq >= 0L) " (range from $fromSeq)" else " (everything before it)"),
+        )
+    }
+
     /** Called on FLUSH: everything queued belongs to the old timeline. */
     fun flush() {
         synchronized(lock) {
@@ -418,6 +569,8 @@ class AudioPipeline(
             gapSince = 0L
             pendingConceal = 0
             primed = false
+            staleFrom = -1L
+            staleUntil = -1L
             lock.notifyAll()
         }
         runCatching {
@@ -501,6 +654,9 @@ class AudioPipeline(
             track?.release()
         }
         track = null
+        // The AAC path owns a platform codec, which is a hardware resource and has to be handed
+        // back explicitly; a stream that comes and goes without this leaks one decoder per switch.
+        runCatching { decoder.close() }
         synchronized(lock) {
             pending.clear()
             nextSequence = -1L
@@ -516,6 +672,9 @@ class AudioPipeline(
             tooLatePackets = 0L
             concealedPackets = 0L
             rebufferCount = 0L
+            flushedPackets = 0L
+            staleFrom = -1L
+            staleUntil = -1L
             primed = false
             lastFrameShorts = 0
             fadeInFrames = 0
@@ -567,8 +726,19 @@ class AudioPipeline(
 
             val body = payload
             val samples = decoder.decodeFrame(body, 0, body.size, out)
-            if (samples <= 0) {
-                SinkLog.w("Dropping undecodable ALAC frame (${decoder.lastError})")
+            if (samples == 0) {
+                // The codec has nothing for this packet yet. Normal while it primes, and not a
+                // lost packet: its audio is still queued inside the codec.
+                reportStatsIfDue()
+                continue
+            }
+            if (samples < 0) {
+                if (decodeFailures < MAX_DECODE_FAILURE_LOGS) {
+                    decodeFailures++
+                    SinkLog.w(
+                        "Dropping undecodable ${codec.label} frame (${decoder.lastError})",
+                    )
+                }
                 // A stream that fails to decode used to be described by nothing but this warning:
                 // the stats below sat behind a successful write, so the one case where they matter
                 // most was the one case that never printed them.
@@ -814,6 +984,25 @@ class AudioPipeline(
 
         val jump = pending.firstKey()
         val lost = jump - nextSequence
+        if (lost > TIMELINE_RESYNC_PACKETS) {
+            // A hole this large is not a loss. The sender has moved to a different part of the
+            // stream — a seek, or a flush we did not hear about — and the old sequence numbers
+            // are never coming. Booking them as thousands of lost packets, and writing stand-in
+            // audio for them, is worse than useless: it stalls the speaker for the whole wait and
+            // then plays silence where music should be.
+            //
+            // So the playhead moves to what actually arrived, the timeline is re-anchored on it,
+            // and the count of lost packets stays where it was.
+            SinkLog.w(
+                "Sequence jumped forward by $lost; treating it as a new position rather than a " +
+                    "loss, and re-anchoring on sequence $jump",
+            )
+            nextSequence = jump
+            gapSince = 0L
+            firstRtpSequence = -1L
+            firstRtpTime = 0L
+            return null
+        }
         skippedPackets += lost
         // The hole is still not filled, but it is no longer left empty: the decode loop writes a
         // stand-in for it so the cushion survives. Caps at MAX_CONCEAL_PACKETS because a stand-in
@@ -877,6 +1066,7 @@ class AudioPipeline(
         val stats = "received $received packets, decoded $decodedPackets, " +
             "skipped $skippedPackets, " +
             "recovered $recoveredPackets, concealed $concealedPackets, tooLate $tooLatePackets, " +
+            "flushed $flushedPackets, " +
             "queued $queued, buffered ${bufferedMs}ms, underruns $underruns"
         SinkLog.i(stats)
         onStats?.invoke(stats)

@@ -21,7 +21,7 @@ class AlacDecoder(
     private val riceHistoryMult: Int = 40,
     private val riceInitialHistory: Int = 10,
     private val riceKModifier: Int = 14,
-) {
+) : AudioDecoder {
 
     private companion object {
         const val RICE_THRESHOLD = 8
@@ -48,14 +48,21 @@ class AlacDecoder(
     private var bitAccumulator = 0
 
     /** True once a frame has decoded without hitting an unsupported construct. */
-    var lastError: String? = null
+    override var lastError: String? = null
         private set
+
+    override val maxFramesPerPacket: Int get() = maxSamplesPerFrame
 
     /**
      * Decodes one packet payload. [out] must hold at least `maxSamplesPerFrame * numChannels`
      * shorts. Returns samples-per-channel, or -1 when the frame cannot be decoded.
      */
-    fun decodeFrame(input: ByteArray, offset: Int, inputLength: Int, out: ShortArray): Int {
+    override fun decodeFrame(
+        input: ByteArray,
+        offset: Int,
+        inputLength: Int,
+        out: ShortArray,
+    ): Int {
         lastError = null
         if (inputLength <= 0) {
             lastError = "empty payload"

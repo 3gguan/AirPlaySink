@@ -54,6 +54,16 @@ object SinkModel {
          * Cleared on every new press, so a stale 200 can never make a dead command look accepted.
          */
         val ap2CommandReply: String? = null,
+        /**
+         * What the playing app published about its own remote commands, e.g.
+         * `app lists 17 commands [...]; scrubbing=no, position=yes`.
+         *
+         * The buttons cannot see the app, so this is the only way to tell "the phone ignored the
+         * scan" from "this app never offered scrubbing in the first place".
+         */
+        val mediaCommands: String? = null,
+        /** The scrubbing bit out of [mediaCommands]; null until an app has published a list. */
+        val senderScrubbing: Boolean? = null,
         /** The cushion the receiver was started with, in milliseconds. */
         val bufferMs: Int = 250,
         val lastError: String? = null,

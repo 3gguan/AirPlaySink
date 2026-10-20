@@ -25,6 +25,28 @@ class Ap2RemoteTest {
     }
 
     @Test
+    fun `seeking is a scan with a start and a stop number per direction`() {
+        // The last four of shairport-sync's simple_command_t, which its header documents as the
+        // numbers the real AP2 remote control command uses. Order matters: 9 stops a forward scan
+        // and 11 a backward one, and pairing them wrongly leaves the phone winding forever.
+        assertEquals(8, Ap2Remote.number(DacpClient.Command.SEEK_FORWARD))
+        assertEquals(9, Ap2Remote.number(DacpClient.Command.SEEK_FORWARD_STOP))
+        assertEquals(10, Ap2Remote.number(DacpClient.Command.SEEK_BACKWARD))
+        assertEquals(11, Ap2Remote.number(DacpClient.Command.SEEK_BACKWARD_STOP))
+
+        assertEquals("scan forward", Ap2Remote.label(Ap2Remote.SCAN_FORWARD))
+        assertEquals("stop scanning backward", Ap2Remote.label(Ap2Remote.SCAN_BACKWARD_STOP))
+    }
+
+    @Test
+    fun `no command number is reused`() {
+        // A copy-paste in the mapping would make two different buttons do the same thing, and only
+        // a listener would notice.
+        val numbers = DacpClient.Command.values().map { Ap2Remote.number(it) }
+        assertEquals(numbers.size, numbers.distinct().size)
+    }
+
+    @Test
     fun `command plist carries the fields the sender reads`() {
         val body = Ap2Remote.command(Ap2Remote.NEXT, groupId)
         assertEquals("sendMediaRemoteCommand", body["type"])

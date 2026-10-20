@@ -9,6 +9,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
@@ -44,6 +46,25 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         /** The on-screen log is capped so the page does not grow without bound. */
         const val VISIBLE_LOG_LINES = 200
         const val RESTART_DELAY_MS = 500L
+
+        /**
+         * How long a held skip button may keep scanning before the receiver stops it anyway.
+         *
+         * A scan has no natural end on the sender's side: it keeps winding until it is told to
+         * stop. The release normally does that, but a lost `ACTION_UP` (a call arriving, the page
+         * being covered) would leave the phone scrubbing to the end of the track, so there is a
+         * ceiling that no interaction can lift. 20 s of scrubbing is already far more than anyone
+         * does inside a car.
+         */
+        const val SEEK_MAX_HOLD_MS = 20_000L
+
+        /** The four halves of a scan; sending one of these never interrupts a running scan. */
+        val SCAN_COMMANDS = setOf(
+            DacpClient.Command.SEEK_BACKWARD,
+            DacpClient.Command.SEEK_FORWARD,
+            DacpClient.Command.SEEK_BACKWARD_STOP,
+            DacpClient.Command.SEEK_FORWARD_STOP,
+        )
     }
 
     private lateinit var rootScroll: ScrollView
@@ -63,6 +84,18 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     private lateinit var nextButton: Button
 
     private lateinit var preferences: SinkPreferences
+
+    /** Fires the stop command if the finger never seems to come up; see [SEEK_MAX_HOLD_MS]. */
+    private val seekHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    /**
+     * The stop half of the scan that is currently running, or null when nothing is scanning.
+     *
+     * Holding it here is what lets release send the *matching* stop: a forward scan must be ended
+     * with 9 and a backward one with 11, and the two are not interchangeable.
+     */
+    private var activeSeekStop: DacpClient.Command? = null
+    private var activeSeekLabel = 0
 
     /** Label resource id -> value view, in the order the rows were added. */
     private val rows = LinkedHashMap<Int, TextView>()
@@ -206,6 +239,20 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         nextButton.setOnClickListener {
             sendRemoteCommand(DacpClient.Command.NEXT, R.string.ui_control_next)
         }
+        // A long press on either skip button scans instead of skipping. The pair is what a car
+        // expects: tap changes track, hold scrubs.
+        bindSeek(
+            previousButton,
+            DacpClient.Command.SEEK_BACKWARD,
+            DacpClient.Command.SEEK_BACKWARD_STOP,
+            R.string.ui_seek_back,
+        )
+        bindSeek(
+            nextButton,
+            DacpClient.Command.SEEK_FORWARD,
+            DacpClient.Command.SEEK_FORWARD_STOP,
+            R.string.ui_seek_forward,
+        )
 
         // The switch remembers its last position across process restarts, so bring the receiver back
         // up if it was on but the process died in the meantime.
@@ -274,6 +321,9 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     }
 
     override fun onStop() {
+        // A finger that was still down when the screen went away never sends ACTION_UP here, and a
+        // scan outliving the page would leave the phone winding with nobody able to stop it.
+        stopSeeking()
         SinkModel.removeListener(this)
         SinkLog.listener = null
         super.onStop()
@@ -555,8 +605,15 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
      * Every press leaves a trace, both in the log and on the status card. A click that does nothing
      * at all is the one outcome this must never have — the head unit's toasts are easy to miss, and
      * without the trace there is nothing to tell "not sent" apart from "sent and ignored".
+     *
+     * [quiet] suppresses only the toast. The two halves of a scan go out this way — a toast when the
+     * finger goes down and again when it comes up would be noise, since the status row already
+     * carries the outcome.
      */
-    private fun sendRemoteCommand(command: DacpClient.Command, labelRes: Int) {
+    private fun sendRemoteCommand(command: DacpClient.Command, labelRes: Int, quiet: Boolean = false) {
+        // Pressing anything else while a scan is running means the user has moved on; end the scan
+        // first, or the phone keeps winding behind whatever they asked for next.
+        if (activeSeekStop != null && command !in SCAN_COMMANDS) stopSeeking()
         val state = SinkModel.state
         val label = getString(labelRes)
         SinkLog.i(
@@ -567,38 +624,127 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
             // The switch can be on while the running receiver still predates that change — it only
             // takes effect on restart. Saying so beats sending into the void.
             if (preferences.ap2Remote && !state.ap2RemoteEnabled) {
-                toast(getString(R.string.ui_ap2_remote_needs_restart))
+                if (!quiet) toast(getString(R.string.ui_ap2_remote_needs_restart))
                 return
             }
             if (state.ap2RemoteEnabled) {
                 // Immediate feedback, then the outcome replaces it: the send goes off the main
                 // thread, and a silent half-second looks exactly like a dead button.
                 setRow(R.string.ui_ap2_remote, getString(R.string.ui_ap2_remote_sending, label))
-                SinkService.ap2Remote(command) { delivery -> reportAp2Remote(delivery, label) }
+                SinkService.ap2Remote(command) { delivery -> reportAp2Remote(delivery, label, quiet) }
                 return
             }
             offerAp2Remote()
             return
         }
         if (state.remoteControl && SinkService.remoteCommand(command)) {
-            toast(getString(R.string.ui_control_sent, label))
+            if (!quiet) toast(getString(R.string.ui_control_sent, label))
             return
         }
-        toast(getString(R.string.ui_control_unavailable))
+        if (!quiet) toast(getString(R.string.ui_control_unavailable))
     }
 
     /** Turns one delivery result into the sentence the user sees. */
-    private fun reportAp2Remote(delivery: Ap2Streams.Delivery, label: String) {
-        toast(
-            when (delivery) {
-                Ap2Streams.Delivery.SENT -> getString(R.string.ui_control_ap2_sent, label)
-                Ap2Streams.Delivery.NO_EVENT_CHANNEL ->
-                    getString(R.string.ui_control_ap2_no_channel)
-                Ap2Streams.Delivery.WRITE_FAILED ->
-                    getString(R.string.ui_control_ap2_write_failed)
-                Ap2Streams.Delivery.NO_STREAM -> getString(R.string.ui_control_ap2_no_stream)
+    private fun reportAp2Remote(delivery: Ap2Streams.Delivery, label: String, quiet: Boolean = false) {
+        if (quiet) {
+            // A held seek reports through the status row only; one toast per step would bury the
+            // screen. Failures still move the row, because a seek that silently stops working is
+            // the thing the row exists to catch.
+            if (delivery != Ap2Streams.Delivery.SENT) {
+                setRow(R.string.ui_ap2_remote, deliverySentence(delivery, label))
+            }
+            return
+        }
+        toast(deliverySentence(delivery, label))
+    }
+
+    private fun deliverySentence(delivery: Ap2Streams.Delivery, label: String): String = when (delivery) {
+        Ap2Streams.Delivery.SENT -> getString(R.string.ui_control_ap2_sent, label)
+        Ap2Streams.Delivery.NO_EVENT_CHANNEL -> getString(R.string.ui_control_ap2_no_channel)
+        Ap2Streams.Delivery.WRITE_FAILED -> getString(R.string.ui_control_ap2_write_failed)
+        Ap2Streams.Delivery.NO_STREAM -> getString(R.string.ui_control_ap2_no_stream)
+    }
+
+    // ------------------------------------------------------------------ seeking
+
+    /**
+     * Makes a skip button scan when it is held down.
+     *
+     * A tap still skips: the long-click listener only fires after the platform's own hold timeout,
+     * and returning `true` from it cancels the click. The touch listener is what notices the finger
+     * coming up — `ACTION_UP` never reaches a long-click handler, so without it a scan would never
+     * be told to stop.
+     */
+    private fun bindSeek(
+        button: Button,
+        start: DacpClient.Command,
+        stop: DacpClient.Command,
+        labelRes: Int,
+    ) {
+        button.setOnLongClickListener {
+            startSeeking(start, stop, labelRes)
+            true
+        }
+        button.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> stopSeeking()
+            }
+            // Never consume: consuming would starve the click and long-click handling above.
+            false
+        }
+    }
+
+    /**
+     * Begins a scan that runs for as long as the button is held.
+     *
+     * One command starts it and one stops it, which is how the phone models scrubbing: 8 runs
+     * forward until 9 arrives, 10 runs backward until 11. There is deliberately no repeat loop —
+     * a scan is continuous, and re-sending "start" would only re-issue something already running.
+     */
+    private fun startSeeking(start: DacpClient.Command, stop: DacpClient.Command, labelRes: Int) {
+        val state = SinkModel.state
+        val label = getString(labelRes)
+        if (state.protocol != SinkProtocol.AP2 || !state.ap2RemoteEnabled) {
+            SinkLog.i(
+                "UI: \"$label\" held, but scanning needs AirPlay 2 remote control " +
+                    "(protocol=${state.protocol}, ap2Remote=${state.ap2RemoteEnabled})",
+            )
+            toast(getString(R.string.ui_seek_needs_ap2))
+            return
+        }
+        // A second button pressed while the first is still scanning: end that one first, or its
+        // stop command would be lost and the phone would keep winding in that direction.
+        stopSeeking()
+        activeSeekStop = stop
+        activeSeekLabel = labelRes
+        SinkLog.i("UI: \"$label\" held — scanning until released")
+        if (state.senderScrubbing == false) {
+            // The app published a command list without scrubbing in it. The phone will still answer
+            // 200 and do nothing, which is exactly the dead end this line exists to name.
+            SinkLog.w(
+                "UI: \"$label\" — this app does not offer scrubbing; expect the phone to ignore it " +
+                    "(${state.mediaCommands})",
+            )
+        }
+        sendRemoteCommand(start, labelRes, quiet = true)
+        seekHandler.postDelayed({ stopSeeking(forced = true) }, SEEK_MAX_HOLD_MS)
+    }
+
+    /** Ends the running scan, if any. Safe to call when nothing is scanning. */
+    private fun stopSeeking(forced: Boolean = false) {
+        val stop = activeSeekStop ?: return
+        val labelRes = activeSeekLabel
+        activeSeekStop = null
+        seekHandler.removeCallbacksAndMessages(null)
+        SinkLog.i(
+            if (forced) {
+                "UI: \"${getString(labelRes)}\" still held after ${SEEK_MAX_HOLD_MS / 1000}s — " +
+                    "stopping the scan anyway"
+            } else {
+                "UI: \"${getString(labelRes)}\" released — stopping the scan"
             },
         )
+        sendRemoteCommand(stop, labelRes, quiet = true)
     }
 
     /**

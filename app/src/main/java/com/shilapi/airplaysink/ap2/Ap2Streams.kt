@@ -1,8 +1,10 @@
 package com.shilapi.airplaysink.ap2
 
+import com.shilapi.airplaysink.audio.AudioCodec
 import com.shilapi.airplaysink.rtsp.RtspReader
 import com.shilapi.airplaysink.rtsp.RtspResponse
 import com.shilapi.airplaysink.rtsp.writeRtsp
+import com.shilapi.airplaysink.util.SeqNo
 import com.shilapi.airplaysink.util.SinkLog
 import java.io.BufferedInputStream
 import java.io.Closeable
@@ -65,6 +67,15 @@ class Ap2Streams(
      * the connection died — has to be visible on a head unit where the toast is swallowed.
      */
     private val onCommandReply: (status: String) -> Unit = {},
+    /**
+     * The device description to post as `updateInfo` the moment the event channel comes up.
+     *
+     * shairport-sync sends this before it does anything else on that connection, and a sender may
+     * take it as the receiver announcing itself: Apple Music will sit in "session open" forever
+     * without ever asking for an audio stream, which is indistinguishable from a dead receiver.
+     * Null means "this session has no description to send" and skips the message.
+     */
+    private val infoPlist: (() -> Map<String, Any?>?)? = null,
 ) : Closeable {
 
     /** Where a `POST /command` ended up. Every value is reported, so none of them is a guess. */
@@ -95,8 +106,9 @@ class Ap2Streams(
          */
         const val AUDIO_BUFFER_BYTES = 256 * 1024L
 
-        /** Compression types from the AirPlay spec; only ALAC is decoded here. */
+        /** Compression types from the AirPlay spec; ALAC is 2 and AAC-LC is 4. */
         const val COMPRESSION_ALAC = 2L
+        const val COMPRESSION_AAC = 4L
 
         private const val MAX_FRAME_BYTES = 64 * 1024
         private const val RTP_HEADER_BYTES = 12
@@ -112,6 +124,7 @@ class Ap2Streams(
         val framesPerPacket: Int,
         val compressionType: Long,
         val audioFormat: Long,
+        val codec: AudioCodec,
     )
 
     private val random = SecureRandom()
@@ -154,6 +167,17 @@ class Ap2Streams(
 
     /** Set once the buffered stream exists, so a second SETUP does not open a second port pair. */
     private var streamDescriptor: Map<String, Any?>? = null
+
+    /** The codec the current stream announced, for the first-frame cross-check against the SSRC. */
+    @Volatile
+    private var streamCodec = AudioCodec.ALAC
+
+    /** What the last SETUP named, reported back to `POST /feedback`. */
+    @Volatile
+    private var streamType = STREAM_TYPE_REALTIME
+
+    @Volatile
+    private var streamRate = 44100
 
     private var audioFrames = 0
     private var realtimePackets = 0
@@ -249,6 +273,7 @@ class Ap2Streams(
         val reader = RtspReader(link.input)
         eventLink = link
         onEventChannel(true)
+        announceSelf()
         try {
             while (!closed.get()) {
                 val request = reader.readRequest() ?: break
@@ -292,6 +317,22 @@ class Ap2Streams(
     }
 
     // ------------------------------------------------------------------ remote control
+
+    /**
+     * Posts `updateInfo` — the same device description `/info` answers with — as the first message
+     * on the event channel.
+     *
+     * shairport-sync's `ap2_event_receiver` does exactly this, immediately after accepting the
+     * connection. Senders differ in whether they wait for it, and a receiver that stays silent
+     * gives a waiting sender no way to proceed — with nothing on the control connection to show it.
+     */
+    private fun announceSelf() {
+        val value = infoPlist?.invoke() ?: return
+        val delivery = sendCommand(
+            linkedMapOf<String, Any?>("type" to "updateInfo", "value" to value),
+        )
+        SinkLog.i("AP2: updateInfo posted on the event channel -> $delivery")
+    }
 
     /**
      * Sends one transport command as an AirPlay 2 `sendMediaRemoteCommand`.
@@ -362,12 +403,27 @@ class Ap2Streams(
             return existing
         }
 
-        val sampleRate = (stream["sr"] as? Long)?.toInt() ?: 44100
-        val framesPerPacket = (stream["spf"] as? Long)?.toInt() ?: 352
-        audioFramesPerPacket = framesPerPacket
+        // The SETUP's own fields, not guesses: a buffered AAC stream from Apple Music carries no
+        // `sr` at all, so falling back to 44100 would play its 48 kHz audio a semitone and a half
+        // flat — and at the wrong pace, which the timeline pacing then spends the session
+        // correcting. The mask names the format outright: 0x00800000 is AAC-LC/48000/stereo.
         val compression = stream["ct"] as? Long ?: COMPRESSION_ALAC
         val audioFormat = stream["audioFormat"] as? Long ?: 0L
-        val channels = channelsFor(audioFormat)
+        val declared = AudioFormatMask.of(audioFormat)
+        val sampleRate = declared?.sampleRate ?: (stream["sr"] as? Long)?.toInt() ?: 44100
+        val framesPerPacket = (stream["spf"] as? Long)?.toInt() ?: 352
+        audioFramesPerPacket = framesPerPacket
+        streamType = type
+        streamRate = sampleRate
+        val channels = declared?.channels ?: channelsFor(audioFormat)
+        val codec = when (compression) {
+            COMPRESSION_AAC -> AudioCodec.AAC
+            COMPRESSION_ALAC -> AudioCodec.ALAC
+            // Anything else is a format this receiver has no decoder for. Naming it ALAC keeps the
+            // session alive and makes the failure audible rather than silent; the log says which.
+            else -> AudioCodec.ALAC
+        }
+        streamCodec = codec
         val key = stream["shk"] as? ByteArray
 
         SinkLog.i(
@@ -375,9 +431,16 @@ class Ap2Streams(
                 "${sampleRate}Hz ${channels}ch spf=$framesPerPacket ct=$compression " +
                 "audioFormat=0x%08X key=%d bytes".format(audioFormat, key?.size ?: 0),
         )
-        if (compression != COMPRESSION_ALAC) {
+        if (declared == null && audioFormat != 0L) {
             SinkLog.w(
-                "AP2: compression type $compression is not ALAC; this sink can only decode ALAC",
+                "AP2: audioFormat 0x%08X is not one this sink knows; trusting sr=$sampleRate"
+                    .format(audioFormat),
+            )
+        }
+        if (codec == AudioCodec.ALAC && compression != COMPRESSION_ALAC) {
+            SinkLog.w(
+                "AP2: compression type $compression has no decoder here; " +
+                    "the ALAC decoder will reject what arrives",
             )
         }
         if (key != null && key.size != Ap2Crypto.KEY_BYTES) {
@@ -406,6 +469,7 @@ class Ap2Streams(
                 framesPerPacket = framesPerPacket,
                 compressionType = compression,
                 audioFormat = audioFormat,
+                codec = codec,
             ),
         )
 
@@ -555,7 +619,10 @@ class Ap2Streams(
         val sequence = if (realtime) {
             timestamp / audioFramesPerPacket.coerceAtLeast(1).toLong()
         } else {
-            beUInt(packet, 0) and 0x7FFF_FFL
+            // The buffered stream's counter is 23 bits wide; [SeqNo] is where that width is
+            // defined, so that the flush endpoints the sender names can be brought into the same
+            // space instead of being compared against a counter of a different width.
+            SeqNo.narrow(beUInt(packet, 0))
         }
         val bodyEnd = packet.size - NONCE_BYTES
 
@@ -586,17 +653,59 @@ class Ap2Streams(
         }
 
         if (audioFrames == 0) {
+            val ssrc = beUInt(packet, 8)
             SinkLog.i(
                 "AP2: first decrypted frame: seq=$sequence ts=$timestamp " +
                     "headerSeq=${beUShort(packet, 2)} " +
-                    "ssrc=0x%08X payload=${payload.size}B".format(beUInt(packet, 8)),
+                    "ssrc=0x%08X payload=${payload.size}B".format(ssrc),
             )
+            // Two independent statements of the same format, both logged: the first bytes say
+            // whether the payload is a raw access unit or carries an ADTS header, and the SSRC is
+            // the sender's own encoding table. If they ever disagree with the SETUP, the sound is
+            // noise and this is the line that says why.
+            SinkLog.i(
+                "AP2: payload starts ${payload.dumpHex(8)}; " +
+                    "ssrc says ${ssrcDescription(ssrc)}; SETUP said ${streamCodec.label} " +
+                    "${streamRate}Hz",
+            )
+            val fromSsrc = ssrcCodec(ssrc)
+            if (fromSsrc != null && fromSsrc != streamCodec) {
+                SinkLog.w(
+                    "AP2: the RTP SSRC says ${ssrcDescription(ssrc)} but the SETUP said " +
+                        "${streamCodec.label}; the decoder will produce noise",
+                )
+            }
         }
         audioFrames++
         onAudio(sequence, timestamp, payload)
     }
 
     private var decryptFailures = 0
+
+    /**
+     * The format the sender encodes in the RTP header's SSRC field.
+     *
+     * These are shairport-sync's `ssrc_t` values (`player.h`), read from real streams: an AirPlay 2
+     * buffered packet does not carry a random synchronisation source, it carries the format. Same
+     * information the `SETUP` gave, arrived at a second way, which makes it a free cross-check.
+     */
+    private fun ssrcDescription(ssrc: Long): String = when (ssrc) {
+        0x0000FACEL -> "ALAC 44100Hz 16bit 2ch"
+        0x15000000L -> "ALAC 48000Hz 24bit 2ch"
+        0x16000000L -> "AAC 44100Hz 2ch"
+        0x17000000L -> "AAC 48000Hz 2ch"
+        0x27000000L -> "AAC 48000Hz 6ch"
+        0x28000000L -> "AAC 48000Hz 8ch"
+        0L -> "nothing (unset)"
+        else -> "a format this sink does not know"
+    }
+
+    /** The codec [ssrc] names, or null when it names none this sink knows. */
+    private fun ssrcCodec(ssrc: Long): AudioCodec? = when (ssrc) {
+        0x0000FACEL, 0x15000000L -> AudioCodec.ALAC
+        0x16000000L, 0x17000000L, 0x27000000L, 0x28000000L -> AudioCodec.AAC
+        else -> null
+    }
 
     /** First bytes as hex, grouped per RTP field width so the header can be read at a glance. */
     private fun ByteArray.dumpHex(limit: Int): String {
@@ -643,6 +752,16 @@ class Ap2Streams(
     }
 
     fun describe(): String = "audio stream, $audioFrames decoded frames"
+
+    /**
+     * The stream the sender set up, as `(type, sample rate)`, or null when there is none.
+     *
+     * `POST /feedback` asks the receiver to state what it is playing, and this is the pair it
+     * wants back. Null means the honest answer is "nothing" — after a pause the phone has torn the
+     * stream down, and reporting the retired one would claim playback that no longer exists.
+     */
+    fun currentStream(): Pair<Long, Int>? =
+        if (streamDescriptor == null) null else streamType to streamRate
 
     /**
      * Closes the audio ports and forgets the stream, without touching the event channel.

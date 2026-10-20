@@ -51,6 +51,19 @@ class SinkService : Service(), RaopEvents {
 
         private val active = AtomicBoolean(false)
 
+        /**
+         * The four commands that make up a scan: start and stop, in each direction.
+         *
+         * They are grouped because their routing is different from every other command: DACP can
+         * only start a scan, so none of them may ever go out on the AirPlay 1 path.
+         */
+        private val SEEK_COMMANDS = setOf(
+            DacpClient.Command.SEEK_BACKWARD,
+            DacpClient.Command.SEEK_FORWARD,
+            DacpClient.Command.SEEK_BACKWARD_STOP,
+            DacpClient.Command.SEEK_FORWARD_STOP,
+        )
+
         /** The live instance, so the UI can relay a key press without binding to the service. */
         @Volatile
         private var instance: SinkService? = null
@@ -276,6 +289,8 @@ class SinkService : Service(), RaopEvents {
                 remoteCommandResult = null,
                 ap2CommandReply = null,
                 lastError = null,
+                mediaCommands = null,
+                senderScrubbing = null,
             )
         }
         updateNotification("Waiting for the iPhone")
@@ -440,6 +455,9 @@ class SinkService : Service(), RaopEvents {
                 eventChannelOpen = false,
                 remoteCommandResult = null,
                 ap2CommandReply = null,
+                // The app that published this list went away with the session.
+                mediaCommands = null,
+                senderScrubbing = null,
             )
         }
         updatePlaybackState()
@@ -453,6 +471,16 @@ class SinkService : Service(), RaopEvents {
      */
     override fun onEventChannelChanged(open: Boolean) {
         SinkModel.update { it.copy(eventChannelOpen = open) }
+    }
+
+    /**
+     * The app's own statement of what it can be asked to do.
+     *
+     * Kept in the model rather than only in the log because the interesting case is a scan that the
+     * phone accepts and then ignores: without this, the only explanation available is a guess.
+     */
+    override fun onSenderMediaCommands(summary: String, scrubbing: Boolean) {
+        SinkModel.update { it.copy(mediaCommands = summary, senderScrubbing = scrubbing) }
     }
 
     /**
@@ -549,6 +577,23 @@ class SinkService : Service(), RaopEvents {
 
     /** Relays a command coming from the UI buttons or a media key. */
     private fun relayRemoteCommand(command: DacpClient.Command) {
+        /*
+         * Seeking is a scan with two halves, and DACP only has the first one: `beginff` / `beginrew`
+         * start it, and there is no endpoint to stop it again (shairport-sync's own DACP table
+         * leaves both stop entries NULL). AirPlay 2 has 9 and 11 for exactly that, so the four scan
+         * commands only ever travel on the AP2 channel; AirPlay 1 gets an honest refusal.
+         */
+        if (command in SEEK_COMMANDS) {
+            if (SinkModel.state.protocol == SinkProtocol.AP2) {
+                if (preferences.ap2Remote) sendAp2RemoteAsync(command) { }
+            } else {
+                SinkLog.w(
+                    "Remote control \"${command.path}\" ignored — scanning needs AirPlay 2; " +
+                        "DACP has no endpoint that stops a scan once it starts",
+                )
+            }
+            return
+        }
         // AirPlay 2 has its own channel for this — the one shairport-sync drives from MPRIS/D-Bus.
         // It carries `sendMediaRemoteCommand` over the encrypted event connection, so the DACP
         // credentials iOS stops sending under AP2 are not needed at all.

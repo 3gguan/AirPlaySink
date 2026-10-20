@@ -29,6 +29,23 @@ object Ap2Remote {
     const val NEXT = 4
     const val PREVIOUS = 5
 
+    /*
+     * Seeking is a scan, not a step: start it, then stop it. These four are the last of
+     * shairport-sync's `simple_command_t`, the range its header documents as "the command number
+     * used in the actual AP2 remote control command", so unlike the numbers past 11 they are
+     * known-good wire values. 8/9 forward, 10/11 backward.
+     *
+     * An earlier version sent the pair Apple's `MRCommand` calls `kMRGoBackFifteenSeconds` (12) and
+     * `kMRSkipFifteenSeconds` (13), guessing the decode from that enum. Measured 2026-10-20 on the
+     * iPhone: every one was acknowledged with `RTSP/1.0 200` and nothing at all happened — eight
+     * presses, no movement. Acknowledgement on this channel means "received", not "executed", so a
+     * 200 is not evidence the number is understood; the four below are.
+     */
+    const val SCAN_FORWARD = 8
+    const val SCAN_FORWARD_STOP = 9
+    const val SCAN_BACKWARD = 10
+    const val SCAN_BACKWARD_STOP = 11
+
     fun number(command: DacpClient.Command): Int? = when (command) {
         DacpClient.Command.PLAY -> PLAY
         DacpClient.Command.PAUSE -> PAUSE
@@ -36,6 +53,10 @@ object Ap2Remote {
         DacpClient.Command.STOP -> STOP
         DacpClient.Command.NEXT -> NEXT
         DacpClient.Command.PREVIOUS -> PREVIOUS
+        DacpClient.Command.SEEK_FORWARD -> SCAN_FORWARD
+        DacpClient.Command.SEEK_FORWARD_STOP -> SCAN_FORWARD_STOP
+        DacpClient.Command.SEEK_BACKWARD -> SCAN_BACKWARD
+        DacpClient.Command.SEEK_BACKWARD_STOP -> SCAN_BACKWARD_STOP
     }
 
     fun label(number: Int): String = when (number) {
@@ -45,6 +66,10 @@ object Ap2Remote {
         STOP -> "stop"
         NEXT -> "next"
         PREVIOUS -> "previous"
+        SCAN_FORWARD -> "scan forward"
+        SCAN_FORWARD_STOP -> "stop scanning forward"
+        SCAN_BACKWARD -> "scan backward"
+        SCAN_BACKWARD_STOP -> "stop scanning backward"
         else -> "command $number"
     }
 

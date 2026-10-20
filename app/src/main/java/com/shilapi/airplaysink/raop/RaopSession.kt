@@ -5,7 +5,9 @@ import com.shilapi.airplaysink.ap2.Ap2Remote
 import com.shilapi.airplaysink.ap2.Ap2SecureLink
 import com.shilapi.airplaysink.ap2.Ap2Session
 import com.shilapi.airplaysink.ap2.Ap2Streams
+import com.shilapi.airplaysink.ap2.BPlist
 import com.shilapi.airplaysink.ap2.BPlistReader
+import com.shilapi.airplaysink.ap2.MrCommands
 import com.shilapi.airplaysink.audio.AudioPipeline
 import com.shilapi.airplaysink.audio.DmapReader
 import com.shilapi.airplaysink.audio.RaopAudioTransport
@@ -21,6 +23,7 @@ import com.shilapi.airplaysink.rtsp.SdpParser
 import com.shilapi.airplaysink.rtsp.textBody
 import com.shilapi.airplaysink.rtsp.writeRtsp
 import com.shilapi.airplaysink.util.Codec
+import com.shilapi.airplaysink.util.SeqNo
 import com.shilapi.airplaysink.util.SinkLog
 import java.io.Closeable
 import java.io.InputStream
@@ -49,6 +52,15 @@ interface RaopEvents {
     fun onTrackChanged(title: String?, artist: String?, album: String?)
     fun onVolumeChanged(decibels: Double)
     fun onProgress(current: Int, total: Int)
+
+    /**
+     * The playing app's own command list, as decoded from `updateMRSupportedCommands`.
+     *
+     * [summary] is already human-readable and goes straight into the log; [scrubbing] is the one
+     * bit the scan buttons care about. Default is a no-op so an implementation that only tracks the
+     * session does not have to care.
+     */
+    fun onSenderMediaCommands(summary: String, scrubbing: Boolean) {}
 
     /**
      * The sender offered its DACP reverse control credentials. A null field means "this request did
@@ -260,6 +272,9 @@ class RaopSession(
     private var lastDacpId: String? = null
     private var lastActiveRemote: String? = null
 
+    /** Last state reported to the sender's `POST /feedback` poll, to log each change once. */
+    private var lastFeedbackReport: String? = null
+
     private val peerDescription: String get() = "${socket.inetAddress.hostAddress}:${socket.port}"
 
     /** Blocking read loop; runs on the session thread. */
@@ -361,6 +376,13 @@ class RaopSession(
                             "  ${request.method} ${request.uri} plist: " +
                                 BPlistReader.describe(described),
                         )
+                        // `updateMRSupportedCommands` is the phone's own statement of what the
+                        // playing app will accept. It is the only way this receiver can tell a scan
+                        // that was ignored from one that was never going to work.
+                        MrCommands.read(described)?.let { report ->
+                            SinkLog.i("AP2: MR ${report.describe()}")
+                            events.onSenderMediaCommands(report.describe(), report.scrubbing)
+                        }
                     } else {
                         SinkLog.i(
                             "  ${request.method} ${request.uri} body: " +
@@ -418,7 +440,7 @@ class RaopSession(
     private fun handleAp2(request: RtspRequest): Boolean {
         // Reaching here means pairing produced a key, which only AirPlay 2 does.
         reportProtocol(SinkProtocol.AP2)
-        when (request.method.uppercase()) {
+        when (routeOf(request)) {
             "SETUP" -> {
                 if (request.content.isEmpty()) return false // a RAOP SETUP; let it through
                 respond(request, ap2Setup(request))
@@ -437,6 +459,26 @@ class RaopSession(
                 SinkLog.i("AP2: FLUSH — dropped buffered audio")
                 respond(request, RtspResponse(200))
             }
+            // The buffered stream's way of saying "throw away what you have". The phone sends this
+            // when it discards its own backlog — after a seek, or when the audio it has queued is
+            // too old to be worth sending — and it names the sequence number the flush runs to.
+            //
+            // Answering it matters more than it looks. The phone carries on from the new position,
+            // so every packet after the flush has a sequence number thousands ahead of the
+            // playhead; a receiver that ignores the request reads that as thousands of lost
+            // packets, waits for a hole that can never be filled, and keeps playing the old
+            // position until it catches up. Measured: `skipped 20028` and an audio track that
+            // slowed to a crawl after a single seek.
+            "FLUSHBUFFERED" -> {
+                flushBufferedAudio(request)
+                respond(request, RtspResponse(200))
+            }
+            // `POST /feedback` is the sender's health probe: "are you actually playing this, and
+            // at what rate?". The answer is a `streams` array, and an *empty* answer means "not
+            // playing" — which is how a receiver that ignores the question gets its stream torn
+            // down by a sender that builds a playback timeline. Every poll measured so far came
+            // over AirPlay 2; the classic RAOP sessions here never asked.
+            "FEEDBACK" -> respond(request, ap2Feedback())
             // Two different requests wear this name. With a `streams` array it ends the *audio
             // stream* and nothing else, which is what the phone sends when playback pauses; without
             // one it ends the session. Treating the first as the second is what made pause-then-play
@@ -467,6 +509,48 @@ class RaopSession(
         }
         return true
     }
+
+    /**
+     * Answers the sender's `FLUSHBUFFERED`: the audio it names is stale and must not be played.
+     *
+     * The request carries the sequence number the flush runs to, and — when it is a *deferred*
+     * flush — the one it starts at. Without a starting point the whole backlog up to the endpoint
+     * is stale, which is the immediate form and the one a seek produces.
+     *
+     * The endpoint arrives in a wider field than the audio blocks' counter, so it is narrowed
+     * before anything compares it — see [SeqNo] for why that matters so much.
+     */
+    private fun flushBufferedAudio(request: RtspRequest) {
+        val plist = safePlist(request.content) as? Map<*, *>
+        val rawUntil = (plist?.get("flushUntilSeq") as? Number)?.toLong() ?: -1L
+        val rawFrom = (plist?.get("flushFromSeq") as? Number)?.toLong() ?: -1L
+        val untilTs = (plist?.get("flushUntilTS") as? Number)?.toLong()
+        val untilSeq = rawUntil.takeIf { it >= 0L }?.let { SeqNo.narrow(it) }
+        val fromSeq = rawFrom.takeIf { it >= 0L }?.let { SeqNo.narrow(it) }
+        if (untilSeq != null) {
+            pipeline?.flushStale(fromSeq ?: -1L, untilSeq)
+        } else {
+            SinkLog.w("AP2: FLUSHBUFFERED without a sequence number; flushing everything")
+            pipeline?.flush()
+        }
+        SinkLog.i(
+            "AP2: FLUSHBUFFERED — the sender discarded its backlog" +
+                (if (untilTs != null) " up to timestamp $untilTs" else "") +
+                "; the playhead moves to the new position" +
+                (if (rawUntil != untilSeq) " (endpoint $rawUntil narrowed to $untilSeq)" else ""),
+        )
+    }
+
+    /**
+     * The name a request is dispatched under.
+     *
+     * Most of the protocol is RTSP-shaped: the verb is the method. A handful of AirPlay 2 requests
+     * are not — `POST /feedback`, `POST /audioMode`, `POST /command` — and carry the meaning in the
+     * path instead. Routing those on the verb alone sent every one of them to the catch-all handler,
+     * which answers 200 with an empty body: the sender's health poll never got its `streams` array
+     * back, so it was told "this receiver is not playing" twice a second, forever.
+     */
+    private fun routeOf(request: RtspRequest): String = ap2Route(request.method, request.uri)
 
     /** A plist the caller is about to describe in the log; null rather than an exception. */
     private fun safePlist(bytes: ByteArray): Any? = try {
@@ -572,6 +656,39 @@ class RaopSession(
      * `Audio-Latency: 0` is what the working implementations return; AirPlay 2 states the real
      * latency in the timing anchor instead.
      */
+    /**
+     * Answers the sender's playback poll.
+     *
+     * shairport-sync's `handle_feedback` is the reference and it is blunt: when the player is
+     * running it returns `{streams:[{type,sr}]}` with the real stream type and sample rate, and
+     * when it is not it returns nothing at all. An empty body is therefore not "OK, no news" — it
+     * is the receiver saying *it is not playing*. A sender that builds a timeline from this
+     * (Apple Music does; QQ Music evidently does not) stops its own playback on that answer, which
+     * looks exactly like a receiver that died: the stream is set up, a second of audio arrives,
+     * and the phone sends a stream-level TEARDOWN.
+     *
+     * The rate is a plist real, not an integer — that is what shairport writes.
+     */
+    private fun ap2Feedback(): RtspResponse {
+        val stream = ap2Streams?.currentStream()
+        if (!streaming || stream == null) {
+            if (lastFeedbackReport != "idle") {
+                lastFeedbackReport = "idle"
+                SinkLog.i("AP2: /feedback — nothing is playing; answering with an empty body")
+            }
+            return RtspResponse(200)
+        }
+        val (type, rate) = stream
+        val report = "$type/$rate"
+        if (lastFeedbackReport != report) {
+            lastFeedbackReport = report
+            SinkLog.i("AP2: /feedback — playing stream type $type at $rate Hz; saying so")
+        }
+        return RtspResponse(200)
+            .addHeader("Content-Type", "application/x-apple-binary-plist")
+            .also { it.content = ap2FeedbackBody(type, rate) }
+    }
+
     private fun ap2Record(request: RtspRequest): RtspResponse {
         if (request.content.isNotEmpty()) {
             SinkLog.i(
@@ -608,15 +725,20 @@ class RaopSession(
             sharedSecret = secret ?: ByteArray(0),
             onFormat = { format ->
                 SinkLog.i(
-                    "AP2: audio format ${format.sampleRate}Hz ${format.channels}ch " +
-                        "spf=${format.framesPerPacket} ct=${format.compressionType} " +
+                    "AP2: audio format ${format.codec.label} ${format.sampleRate}Hz " +
+                        "${format.channels}ch spf=${format.framesPerPacket} " +
+                        "ct=${format.compressionType} " +
                         "audioFormat=0x%08X".format(format.audioFormat),
                 )
+                // A second SETUP means a new stream, and the old pipeline owns an AudioTrack and,
+                // for AAC, a platform codec. Hand both back before taking new ones.
+                pipeline?.let { runCatching { it.close() } }
                 pipeline = AudioPipeline(
                     sampleRate = format.sampleRate.coerceIn(8000, 96000),
                     channels = format.channels.coerceIn(1, 2),
                     framesPerPacket = format.framesPerPacket.coerceIn(16, 4096),
                     cushionMs = config.cushionMs,
+                    codec = format.codec,
                 )
             },
             onAudio = { sequence, timestamp, payload ->
@@ -645,10 +767,12 @@ class RaopSession(
                 events.onEventChannelChanged(open)
             },
             onCommandReply = { status -> events.onAp2CommandReply(status) },
-            // Deliberately not sending updateInfo here: the phone answers the bare command with
-            // RTSP/1.0 200, so nothing in this receiver waits for it. shairport-sync does send it,
-            // but the earlier attempt here ran with the mirrored event key pair, so its failure
-            // measured the keys, not the message.
+            // shairport-sync opens the event channel by posting `updateInfo` (ap2_event_receiver.c
+            // does it the instant the connection is accepted), and this receiver used to stay
+            // silent. The earlier attempt at sending it here measured nothing: it ran with the
+            // mirrored event key pair, so the disconnect it caused was the encryption, not the
+            // message. With the keys right, the worst case is the phone ignoring it.
+            infoPlist = { ap2?.infoPlist() },
         )
     }
 
@@ -1040,6 +1164,37 @@ class RaopSession(
  */
 internal fun teardownEndsOnlyTheStream(plist: Any?): Boolean =
     (plist as? Map<*, *>)?.get("streams") is List<*>
+
+/**
+ * The body of a `POST /feedback` answer: `{streams:[{type, sr}]}`.
+ *
+ * Kept as a pure function because two details in it are silent when wrong. `sr` has to be a plist
+ * *real* (shairport-sync writes `plist_new_real`), and `type` has to be the stream type the SETUP
+ * named — 96 realtime, 103 buffered — not a boolean "yes, playing". Either mistake produces a plist
+ * that parses fine and says nothing useful.
+ */
+internal fun ap2FeedbackBody(type: Long, rate: Int): ByteArray = BPlist.write(
+    linkedMapOf<String, Any?>(
+        "streams" to listOf(
+            linkedMapOf<String, Any?>("type" to type, "sr" to rate.toDouble()),
+        ),
+    ),
+)
+
+/**
+ * The dispatch name for a request: the verb for RTSP-shaped requests, the last path segment for the
+ * handful of AirPlay 2 requests that are addressed by path (`POST /feedback`, `POST /audioMode`,
+ * `POST /command`).
+ *
+ * Kept out of the session so it can be tested: getting it wrong is silent. The poll still gets a
+ * 200, the log still looks healthy, and the only symptom is that the sender believes the receiver
+ * is not playing.
+ */
+internal fun ap2Route(method: String, uri: String): String {
+    val verb = method.uppercase()
+    if (verb != "POST") return verb
+    return uri.trimEnd('/').substringAfterLast('/').uppercase()
+}
 
 private fun String.intValueAfter(marker: String): Int? {
     val index = indexOf(marker)

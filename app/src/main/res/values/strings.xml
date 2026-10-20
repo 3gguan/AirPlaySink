@@ -14,7 +14,7 @@
     <string name="ui_start_on_boot">开机后自动开启</string>
 
     <string name="ui_airplay2">使用 AirPlay 2</string>
-    <string name="ui_airplay2_hint">关闭后回到 AirPlay 1（RAOP）。AirPlay 2 断开时手机会主动结束会话；它没有 DACP，但有自己的遥控通道——要上一首 / 播放暂停 / 下一首，请打开下面的「AP2 反向控制（实验性）」。AirPlay 1 用 DACP，且会重传丢失的音频包。切换会重启服务。</string>
+    <string name="ui_airplay2_hint">关闭后回到 AirPlay 1（RAOP）。AirPlay 2 断开时手机会主动结束会话；它没有 DACP，但有自己的遥控通道——要上一首 / 播放暂停 / 下一首 / 长按快进快退，都需要它，见下面的「AP2 反向控制」。AirPlay 1 用 DACP，且会重传丢失的音频包。切换会重启服务。</string>
     <string name="ui_airplay2_applied">协议已切换，正在重启服务</string>
 
     <string name="ui_ap2_remote_switch">AP2 反向控制</string>
@@ -85,6 +85,10 @@ adb shell appops set com.shilapi.airplaysink SYSTEM_ALERT_WINDOW allow</string>
     <string name="ui_control_previous">上一首</string>
     <string name="ui_control_play_pause">播放/暂停</string>
     <string name="ui_control_next">下一首</string>
+    <string name="ui_seek_hint">长按「上一首」快退、长按「下一首」快进，松手即停；按住越久走得越远。</string>
+    <string name="ui_seek_back">快退</string>
+    <string name="ui_seek_forward">快进</string>
+    <string name="ui_seek_needs_ap2">快进 / 快退用的是 AirPlay 2 的扫描命令——开始一条、停止一条。AirPlay 1 的 DACP 只有「开始快进」，没有能把它停下来的接口，所以这里直接说明不支持，而不是让手机一路扫到曲末。要用长按，请打开「使用 AirPlay 2」和「AP2 反向控制」。</string>
     <string name="ui_control_sent">已发送：%1$s</string>
     <string name="ui_control_unavailable">反向控制暂不可用，请先让 iPhone 连上本车机</string>
     <string name="ui_control_ap2_title">AP2 反向控制没打开</string>

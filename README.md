@@ -12,6 +12,7 @@
 | --- | --- |
 | AirPlay 1 音频接收（RAOP，`_raop._tcp`） | ✅ 完整实现 |
 | ALAC 解码（352 帧/包，16bit，44.1kHz，双声道） | ✅ 内置解码器 |
+| AAC-LC 解码（1024 帧/包，44.1/48kHz，双声道，AirPlay 2） | ✅ 走系统 `MediaCodec` |
 | AES-128-CBC 音频解密 + RSA-OAEP 会话密钥解封 | ✅ |
 | RTP 收流、乱序重排、缺包重传（resend） | ✅ |
 | RTSP 控制：OPTIONS / ANNOUNCE / SETUP / RECORD / FLUSH / TEARDOWN / PAUSE / GET·SET_PARAMETER | ✅ |
@@ -19,6 +20,7 @@
 | 音量控制（`volume: -xx.xx` dB） | ✅ |
 | **DACP 反向控制**（用方向盘 / 界面按钮遥控 iPhone 切歌、播放暂停） | ✅ 仅 **AirPlay 1** |
 | **AP2 反向控制**（`sendMediaRemoteCommand`，走事件通道） | ✅ 默认开启，见下文 |
+| **快进 / 快退**（长按上一首 / 下一首，松手停） | ✅ 仅 **AirPlay 2**（命令 8/9、10/11） |
 | 前台服务 + Wi-Fi Lock + Multicast Lock，息屏继续接收 | ✅ |
 | 开机自启（可选） | ✅ |
 | 进程被杀后自动恢复（START_STICKY + 网络事件拉起） | ✅ |
@@ -55,8 +57,10 @@ app/src/main/java/com/shilapi/airplaysink/
 │   └── RaopSession.kt         一次控制连接的全部方法分派
 ├── audio/
 │   ├── RaopAudioTransport.kt  RTP 收流、重传请求、AES 解密
-│   ├── AudioPipeline.kt       重排 + ALAC 解码 + AudioTrack 输出
+│   ├── AudioPipeline.kt       重排 + 解码 + AudioTrack 输出
+│   ├── AudioDecoder.kt        解码器接口（ALAC / AAC 共用一条管线）
 │   ├── AlacDecoder.kt         ALAC 解码器（Hammerton 移植，已对照 Apple ag_dec.c）
+│   ├── AacDecoder.kt          AAC-LC 解码器（系统 MediaCodec）
 │   └── DmapReader.kt          DMAP 元数据解析
 ├── crypto/
 │   ├── AirPortKey.kt          内嵌 AirPort Express RSA-2048 私钥（PKCS#8）
@@ -67,11 +71,24 @@ app/src/main/java/com/shilapi/airplaysink/
 ├── rtsp/
 │   ├── Rtsp.kt                RTSP 请求解析与响应序列化
 │   └── SdpParser.kt           SDP（`a=fmtp:` / `a=rsaeskey:` / `a=aesiv:`）解析
+├── ap2/
+│   ├── Ap2Session.kt          AirPlay 2 会话：配对、M4、事件通道、/feedback
+│   ├── Ap2Crypto.kt           SRP-6a / ChaCha20-Poly1305 密钥协商
+│   ├── Ap2SecureLink.kt       加密通道（control / events 两条 HKDF 密钥方向不对称）
+│   ├── Ap2Streams.kt          音频流：实时(96) 与缓冲(103) 的端口、序列号、事件端口
+│   ├── Ap2Remote.kt           反向控制：sendMediaRemoteCommand 的命令号与归档报文
+│   ├── MrCommands.kt          updateMRSupportedCommands 解码（App 支持哪些媒体键）
+│   ├── AudioFormatMask.kt     audioFormat 位掩码 → 编码与采样率
+│   ├── BPlist.kt / BPlistReader.kt  二进制 plist 编解码
+│   ├── SrpServer.kt / Tlv8.kt       配对握手
+│   └── Ap2Txt.kt              _airplay._tcp 的 TXT 记录
 ├── net/
 │   ├── MdnsAdvertiser.kt      只广播 `_raop._tcp`（走系统 NsdManager）+ AirTunes TXT 记录
+│   ├── Ap2Advertiser.kt       广播 `_airplay._tcp`
 │   └── LocalNetwork.kt        挑一个地址用于显示与"有没有网络"判断（监听不绑它）
 └── util/
     ├── Codec.kt               Hex / 非标准 Base64 / 大端读写
+    ├── SeqNo.kt               AirPlay 2 的 23 位序列号口径（窄化 + 模 23 比较）
     └── SinkLog.kt             环形内存日志 + logcat，供界面实时显示
 ```
 
@@ -235,11 +252,61 @@ classic 的请求上，一旦 iOS 按 AP2 协商，请求里就没有它们，�
 | 控制通道 | M4 之后整条 RTSP 切到 HAP 分帧：`uint16 长度 ‖ ChaCha20-Poly1305 ‖ tag`，双向独立密钥 |
 | 音频 | SETUP 两次：先开事件端口，再开流；`96` realtime（UDP RTP）与 `103` buffered（TCP 分帧），ALAC 解密后进同一条 `AudioPipeline` |
 | 音量 | `SET_PARAMETER` 的 bplist `volume`（dB，与 RAOP 的 `volume:` 文本行同量纲） |
-| 事件通道 | 在 `Events-Salt` 密钥下应答；也用它向发送端发命令（见下一节） |
+| 事件通道 | 在 `Events-Salt` 密钥下应答；连上后立刻发一条 `updateInfo`；也用它向发送端发命令（见下一节） |
+| `FLUSHBUFFERED` | 发送端说「我丢掉了我缓冲的音频」，答 200 并把播放头移到新位置 |
+| `POST /feedback` | 回 `{streams:[{type,sr}]}` 说明「正在播的是什么」，见下面的注 |
 | 反向控制 | 开关打开时发 `sendMediaRemoteCommand`，走事件通道 |
+
+> `supportedFormats.bufferStream` 里带着 AAC-LC（`0x400000` 44.1k、`0x800000` 48k）。这两个位
+> 不是给解码器用的，是给发送端看的：Apple Music 先读这张能力表再决定要不要建流，只写 ALAC 时它
+> 会一直停在「会话开着、什么都不播」，连 `SETUP (streams)` 都不发——看起来就像接收端死了。
+> shairport-sync 的 mask 默认就是 `0xC40000`。
+>
+> 补上 AAC 位之后，Apple Music 真的来建流了，带来的却是 **AAC-LC 48 kHz**（`ct=4`），
+> 而本机当时只有 ALAC 解码器——于是每一帧都被当成非法 ALAC 丢掉，偶尔蒙对几帧就是一片杂音。
+> 现在 `AacDecoder` 走系统 `MediaCodec` 解 AAC-LC，`AudioPipeline` 按 `ct` 选解码器。
+> 格式的判断有两条独立的依据：SETUP 的 `audioFormat` 位掩码（`0x00800000` = AAC-LC/48k/2ch，
+> 位号 23 与发送端另发的 `audioFormatIndex` 是同一个数），以及 RTP 头里的 SSRC
+> （shairport-sync 的 `ssrc_t`：`0x17000000` = AAC/48k/2ch）。日志会把两者都打出来对照。
+>
+> 另一个坑：Apple Music 的 SETUP **不带 `sr`**，所以「取不到就用 44100」会让它的 48 kHz 音频
+> 慢一个半音、节奏也全错。采样率必须从 `audioFormat` 掩码里读。
+>
+> 第三个坑：**`FLUSHBUFFERED`**。缓冲流（`type=103`）允许手机丢弃自己缓冲的音频——拖进度条时
+> 就会发，它带着一个 `flushUntilSeq`（序列号终点）。不处理它的后果不是「多播一会儿旧歌」那么
+> 简单：手机从新位置继续发，之后每个包的序列号都比播放头前几千，管线把这看成「丢了几千个包」，
+> 等一个永远填不上的坑（900 ms），再写几千个包的仿真音频——实测 `skipped 20028`，
+> 音轨慢到爬。现在答 200，并把「到终点为止的音频」在到达时就丢掉（`AudioPipeline.flushStale`），
+> 播放头随之移到新位置。另外加了一道保险：序列号跳变超过 1000 个包就当成**换了位置**而不是
+> **丢了包**，重新锚定而不记成损失。
+>
+> 这里还有一个更隐蔽的坑：**两边的序列号宽度不一样**。音频块自己带的计数器只有 **23 位**
+> （`seq = nctohl(packet[0]) & 0x7FFFFF`，每 8388608 个块回绕一次），而 `flushUntilSeq` 是个
+> **32 位**字段。shairport-sync 在 `handle_flushbuffered()` 里明确先做 `flushUntilSeq & 0x7fffff`
+> 再比较——不窄化就会拿一个 32 位的数去比 23 位的计数器，朴素比较 `sequence <= until` 对**每一个**
+> 包都为真，于是整条音频流被永久丢弃，表现为「FLUSHBUFFERED 之后统计行彻底消失」。
+> 真机抓到过的一组数字可以对上：端点 `10299533` 窄化后是 `1910925`，与该流首帧 `1904383` 相差
+> 6542 个块，正好等于 RTP 时间戳的位移 `6699008 / 1024 = 6542`。
+> 现在端点先经 `util/SeqNo.narrow()` 窄化，比较用**模 23 算术**（`SeqNo.difference()`，按 bit22
+> 符号位解释），所以计数器回绕时也不会把「刚发的旧包」误判成「端点之后的新包」。
+> 单测 `SeqNoTest` 钉住窄化、端点前后边界、回绕与对称性。
 
 刻意没做：PTP 时钟同步（本机自己走自己的时钟，不参与多房间对齐）、
 HomeKit / `/pair-verify`（transient 配对够用，也不需要 Ed25519 身份）。
+
+> `POST /feedback` 是发送端每 2 秒一次的**健康查询**：「你到底在播没有？播的是什么？」
+> 答案必须是一个 `streams` 数组（`type` = 96/103，`sr` 是 plist real）；**空 body 的含义是
+> 「没在播」**，不是「没事」。shairport-sync 的 `handle_feedback` 就是这么写的。
+> 本机早期对它只回一个空 200，等于一直告诉手机「我没有在播」——AirPlay 1 的会话从不问这个问题，
+> 所以 AP1 一直正常；AP2 下会拿它建播放时间线的 App（Apple Music）会在流刚建好一秒后自行停掉，
+> 表现正是「连上了，一点播放就立即停止」。QQ 音乐不看这个字段，所以同样的接收端它能播。
+>
+> 追这条时踩过的第二个坑：**它没有「动词」**。整个协议是按 RTSP 方法分发的，但
+> `POST /feedback`、`POST /audioMode`、`POST /command` 的方法一律是 `POST`，含义在路径里。
+> 只按方法分发时这三个全落进「兜底回 200」，`/feedback` 的应答分支成了永远执行不到的死代码——
+> 日志上仍然是干净的 `POST ... answered with 200`，看起来一切正常。现在 `ap2Route()` 先取路径
+> 末段再分发，单测 `Ap2RouteTest` 钉住这条。
+
 
 > `TEARDOWN` 在 AirPlay 2 里是**两个请求共用一个名字**，靠 body 区分：带 `streams` 数组的是
 > 「停这条音频流，连接照旧」，不带（或读不出）才是「结束整个会话」。手机**每次暂停都会发前者**。
@@ -285,8 +352,37 @@ Content-Type: application/x-apple-binary-plist
 | --- | --- | --- | --- |
 | play | 0 | next | **4** |
 | pause | 1 | previous | **5** |
-| play/pause | 2 | fast forward / rewind | 8 / 10 |
-| stop | 3 | | |
+| play/pause | 2 | 开始快进 / 停止快进 | **8 / 9** |
+| stop | 3 | 开始快退 / 停止快退 | **10 / 11** |
+
+快进快退是**一对**命令：8 让手机开始往前扫，9 让它停；10 / 11 是反过来的那一对。这四条是
+shairport-sync 枚举的最后一段（它到 `rewind_stop = 11` 为止），也正是它注释里说的「AP2 实际使用的编号」。
+
+> **别用 12 / 13。** 最开始本机发的是苹果 `MRCommand` 里的 `kMRGoBackFifteenSeconds = 12` /
+> `kMRSkipFifteenSeconds = 13`（iPhone 锁屏那两个「15 秒」按钮），以为能一跳 15 秒。2026-10-20 实测：
+> 八次按下，**每次都收到 `RTSP/1.0 200`，音乐一动不动**。200 在这条通道上只代表「收到了」，不代表
+> 「执行了」——所以能不能用不能靠应答判断，只能看 8–11 这四个已知有效的号。
+
+界面上**长按上一首 / 下一首**就是这两对：点一下照旧切歌，长按（过系统的长按阈值，约 0.5 秒）发一条
+「开始扫」并一直扫到松手，松手发对应的「停止扫」（`ACTION_UP` / `ACTION_CANCEL` 都会停，页面被切走时
+`onStop` 也会停，另外还有 20 秒的硬上限，防止 `ACTION_UP` 丢掉后手机一路扫到曲末）。按住期间按别的键
+会先停扫再执行那个键。AirPlay 1 没有这条路——DACP 只有 `beginff` / `beginrew`，**没有停止它们的接口**
+（shairport-sync 的命令表里两个 stop 都是 NULL），所以 AP1 下长按会直接告诉你它做不到。
+
+App 到底支不支持扫，其实手机自己说过一次：它接管 now-playing 时会发
+`POST /command {type:"updateMRSupportedCommands"}`，里面是**一串 hex bplist（plist 套 plist）**，
+逐条给出命令号、是否启用，以及两个能力位。8–11 无论 App 支不支持都回 200，所以这张表是唯一能区分
+「被忽略」和「本来就不支持」的东西。日志里是一行摘要：
+
+```
+AP2: MR app lists 3 commands [play pause next]; scrubbing=yes, position=yes
+```
+
+> **键名是短名。** 按苹果头文件里的 `kMRMediaRemoteCommandInfoCommandKey` 去读，一条都读不到，
+> 每款 App 都显示成 `app lists 0 commands [none]`——看着像「所有 App 都不支持扫描」，其实是解码器
+> 读错了键。真实报文里是 `kCommandInfoCommandKey` / `kCommandInfoEnabledKey`，两个能力位
+> （`…CanBeControlledByScrubbingKey`、`…SupportsReferencePosition`，后者**没有** `Key` 后缀）嵌在
+> `kCommandInfoOptionsKey` 这个字典里。单测里存了一条从手机抓下来的原始 entry 钉住这个形状。
 
 `DestinationDeviceUIDs` 是唯一不直观的地方：它是一个 **NSKeyedArchiver 归档的
 `NSMutableArray`**，里面只有一个字符串——会话的 **group UUID**（`kMRMediaRemoteOptionDestinationDeviceUIDs`
@@ -525,14 +621,17 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | 看得到但点不动 / 一连就断 | 见下一行。也看日志有没有 `Could not unwrap the AES session key`（RSA 解封失败，确认 `et=0,1` 是否生效） |
 | **连上瞬间就断，日志只有 `Control connection from` 紧跟 `Control connection closed`** | 发送端在等 `Apple-Response`。看 `RTSP <-` 那行里有没有 `apple-challenge=`：**有** → 我们没回或回错了（本版已实现，`RTSP ->` 那行之后应能看到 `Apple-Response`）；**没有** → 那是别的原因，看下一行的完整头 |
 | 日志里 `RTSP <-` 下一行的 `hdr:` 打出了完整请求头 | 这是诊断发送端行为的**主要依据**。把这两行截出来就能看出 iPhone 到底发了什么、我们回得对不对 |
-| 连上了但完全没声音 | 日志有没有 `First audio packet received`；有包但无声 → 看 `Dropping undecodable ALAC frame`；如果日志出现 `The sender chose AAC`，说明发送端选了本端不支持的编码 |
+| 连上了但完全没声音 | 日志有没有 `First audio packet received`；有包但无声 → 看 `Dropping undecodable … frame` 那行里的编码名（`ALAC` 还是 `AAC-LC`）。**若是 `AAC-LC` 而本机没解码器，就是这行**；现在两种都有解码器，所以这行出现本身就说明「SETUP 说的格式」和「实际收到的格式」对不上 |
+| **有杂音 / 一片沙沙声**（AP2，Apple Music 常见） | 编码用错了：日志里 `AP2: buffered stream: … ct=4 audioFormat=0x00800000` 表示发送端给的是 **AAC-LC 48 kHz**，而解码器按 ALAC 走就会每帧报错、偶尔蒙对几帧变成杂音。正确状态是 `AP2: audio format AAC-LC 48000Hz 2ch` ＋ `AAC decoder ready: AAC-LC 48000Hz 2ch … raw access units, csd-0=1190`。另外 `payload starts …` 那行会告诉你包是裸 access unit 还是带 ADTS 头 |
 | 声音断续 / 卡顿 | 看 `decoded N packets, skipped M, recovered R, concealed C, queued K, buffered Xms, underruns U`。① **`buffered` 是听感余量**（还没播出去的音频），也是抗抖动能力的全部来源 —— 它薄（几十毫秒）时任何停顿都会断；正常应稳定在 `AudioPipeline.TARGET_CUSHION_MS`（250 ms）附近。② **`underruns` 是 AudioTrack 自己数的欠载次数**：它在涨 = 卡顿属实且是饿死，不是拥塞。③ `recovered` 是"等重传等回来了"的包数，`skipped` 是等不到、直接放弃的包数 —— 前者远大于后者说明重传链路在正常工作。④ **`buffered` 只降不升说明余量在被跳号吃掉**：每跳一个包永久少 8 ms，而发送端按 1 倍速推流、不会补回来，实测 13 分钟里余量掉 114 ms 而 `skipped` 恰好 +14（×8 ms = 112 ms，误差 2%）—— 跳号是余量**唯一**的消耗项。⑤ `concealed` 是"放弃的缺口里补上了仿真音频"的包数：现在每个被放弃的包都会写一份前一帧的副本顶上，所以跳号**不再消耗余量**，`buffered` 应当长期平稳而不是缓慢下滑。副本不是原样重放：它以**说话人正握着的那个采样**开头（`DECLICK_FRAMES`、2 ms 内过渡掉），整段衰减到静音，后面的真实包再从静音淡入 2 ms —— 缺了这一步，重放的那 8 ms 就是一段满电平的方波接缝，听感就是一声爆音。⑥ 余量若因极端丢包被吃到 `REBUFFER_FLOOR_MS`（40 ms）以下，管线会暂停并重灌到目标余量，日志里是一条 `Cushion down to Xms; refilling` —— 代价是那一下约 250 ms 的静音，换来的是后面不再连续欠载。**这条日志正常应当只出现一次**：如果同一秒里连着刷出好几条（旧版在 FLUSH 后刷过 10 条），说明重灌逻辑在自激 —— 队列里已经攒够一整份余量时暂停毫无意义，等重灌完`primed` 又没被清掉，下一个包就会再触发一次。⑦ **`tooLate` 是"重传回来了、但播放已经走过去"的包数**，用来区分两种放弃：`tooLate` 跟 `skipped` 同步涨 = `GAP_WAIT_MS` 还短，加长能救回来；`tooLate` 长期为 0 = iPhone 压根没回包，再等也没用，只能靠隐藏。只统计**差 64 个包（512 ms）以内**的迟到：重传应答会把几秒前已经播过的包再发一遍，全算进来会让这个数虚高到 `skipped` 的三倍，那这个判据就白看了 |
 | 偶尔「爆音／咔哒」 | 几乎总是**跳号**（`skipped` 在涨）—— 波形被硬接一刀。判断方法：听的时候盯 `skipped`，它每次 +1 就是一声。要减少它，得让缺口尽量被重传补回来：`RaopAudioTransport` 现在对同一个缺口最多问 4 次（间隔 45 ms，最后一次在 135 ms 左右发出，仍落在 `GAP_WAIT_MS` 200 ms 内），限流时**放回队列**而不是直接丢弃（旧代码丢弃过，等于压根没问发送端），且 `RESEND_BACKOFF_MS` 已从 40 ms 降到 12 ms —— 包间隔才 8 ms，一次突发会同时压出好几个缺口，40 ms 的节流等于把第 4 个缺口拖到 160 ms 才问出去，早就错过播放点。如果 `skipped` 仍在涨，看 `recovered : skipped` 的比例和 `tooLate`：比例高且有 `tooLate` → 链路在丢包但重传能救，继续加 `GAP_WAIT_MS`；比例低且 `tooLate` 为 0 → iPhone 在忽略重传请求，只能靠隐藏 |
 | 息屏后停住 | 先看日志 `Locks: wifi=true multicast=true`（Wi-Fi 锁已持有，链路不会被挂起）；都正常还停，就是车机的省电策略把服务掐了，按上面的「不受限制」设置放开 |
 | 状态卡一直显示「等待网络…」 | 车机还没拿到 IPv4。去车机 Wi-Fi 设置确认已连上 iPhone 热点。**不用重开 App** —— 连上后服务会自己开始广播 |
 | **按暂停有效，再按播放没反应（音乐不回来）** | 症状是「播放」按下去状态卡还停在「已就绪」但手机不理。看日志里暂停那一刻有没有 `AP2: TEARDOWN plist: {streams:[…]}` 紧跟 `AP2: audio stream stopped; the session and its event channel stay up` —— 有就是对的路径（流停了、会话还在）。如果日志是 `AP2: TEARDOWN — the session ends here` 或 `TEARDOWN received; closing the session`，说明这条被当成会话结束处理了，控制连接随之消失，后续按键全部落在 `protocol=null` 上。 |
+| **Apple Music 在 AirPlay 2 下不播（连上后点播放毫无反应；切到 AirPlay 1 又正常）** | 先分清是哪一种，日志会直接给出：**① 有 `AP2: SETUP (streams)` / `First audio packet received`，但几秒后 `AP2: TEARDOWN`** → 流被手机自己撤了，看 `POST /feedback` 那几行是不是空应答（正确应答是 `AP2: /feedback — playing stream type 96 at 44100 Hz; saying so`）。② **通篇没有 `SETUP (streams)`**（只有 `RECORD — session open` 和每 2 s 一次的 `/feedback`）→ 手机压根不愿意建流，`/feedback` 与它无关，看 `/info` 能力表和事件通道：`supportedFormats.bufferStream` 必须带 AAC-LC 位（`0xC40000`，否则 Apple Music 判本机没法放），并且事件通道连上后要发 `updateInfo`（日志 `AP2: updateInfo posted on the event channel -> SENT`）。这条查询只有 AirPlay 2 的会话会发，AP1 从来不暴露这些问题。 |
 | **AirPlay 2 下按上一首 / 播放暂停 / 下一首音乐直接停了** | 先看日志结尾：如果是 `AP2: events <- command reply RTSP/1.0 200` 之后才断，那是手机随后自己结束了会话（它在切歌/暂停，不是报错）。如果是 `AP2: sender closed the encrypted channel without sending a frame` 紧跟 `The sender closed the control stream`，那是事件通道的加密帧手机解不开——检查 `ChannelKeys.EVENTS` 是不是被“顺手统一”成了 control 的镜像（写 `Events-Read…`）。这正是本机踩过的坑。 |
 | AP2 下按了按钮，状态卡停在「已送出 · 等手机应答」 | 手机收下了但没回话，或回话到了但事件通道已断。看日志有没有 `AP2: events <- command reply`；没有就去确认 `ap2Remote=true`、`event channel up` 两行都在。 |
+| **AP2 拖进度条之后整条音频流哑了**（统计行不再出现） | 统计行 `received N packets, …` 在 `FLUSHBUFFERED` 之后**彻底消失**，说明之后的包全被当成过时数据丢掉了。根因是端点宽度不匹配：音频块的计数器只有 23 位，而 `flushUntilSeq` 是 32 位，比较前必须先 `& 0x7fffff` 窄化（shairport-sync 的 `handle_flushbuffered()` 就是这么做的），并用模 23 算术比较。当前版本已在 `util/SeqNo.kt` 处理；日志会打出 `endpoint 10299533 narrowed to 1910925` 供核对。若这行缺失或窄化值可疑，说明回到旧逻辑了。 |
 | 「反向控制」一直是"等待 iPhone 提供"，点按钮没反应 | 说明 `_dacp._tcp` 没解析出来。先确认没在 AP2 会话里（状态卡「当前协议」）；再看日志有没有 `Remote control offered: DACP-ID=... Active-Remote=...`（有 = iPhone 确实把凭据给了）；再看有没有 `DACP: "iTunes_Ctrl_..." at ...:port`（有 = 端口解析成功）。只有前者没有后者 → mDNS 应答被拦，或这台 iPhone 没广播这个服务 |
 
 日志里这些行是**正常**的：
@@ -562,7 +661,9 @@ DACP: "iTunes_Ctrl_CFAE09D9DA7527E9" at 172.20.10.1:53111 (matched by DACP id)
   报文本身没问题。`ChannelKeysTest` 盯着这个不对称，别为了"统一"把它改成循环派生。
 - **AP2 反向控制只在手机打开了事件通道时可用**。日志里 `AP2: event channel up` 之前按按钮，
   只会在状态卡上留下「命令通道未打开」。
-- 只支持 **ALAC** 和 **PCM**（按 `cn=0,1` 协商）。如果发送端坚持 AAC，本端会解不出来 —— 日志里会明说。
+- **AirPlay 1 只支持 ALAC 和 PCM**（按 `cn=0,1` 协商）。**AirPlay 2 多一种 AAC-LC**，
+  由系统 `MediaCodec` 解（`AacDecoder`）；AAC-ELD、Opus 仍然解不出来 —— 日志里会明说
+  （`compression type N has no decoder here`）。
 - 单客户端：同一时刻只有一个 iPhone 能连，新连接会顶掉旧连接（这是 AirTunes 语义）。
 - 音频延迟按 RAOP 默认节奏走，没有做额外的时钟同步补偿。听感延迟**等于**流水线手里握着多少音频（`AudioPipeline.TARGET_CUSHION_MS`，当前 250 ms）—— 余量就是延迟，**1:1，只能同增同减**：想更抗卡就得更慢，想更快就更脆。
 - ALAC 解码器与 iOS 实际码流的对照验证是在代码级完成的，**还没有在真机真流上长时间跑过**。

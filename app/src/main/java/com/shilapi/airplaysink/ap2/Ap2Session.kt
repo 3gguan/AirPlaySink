@@ -61,6 +61,18 @@ class Ap2Session(
         /** ALAC / 44100 / signed 16-bit / stereo — the only thing this sink's decoder handles. */
         private const val AUDIO_STREAM_FORMATS = 0x40000L
 
+        /**
+         * What the sender may put in a *buffered* stream (`type 103`).
+         *
+         * Same ALAC pair as above, plus the two AAC-LC entries shairport-sync always advertises
+         * (`0x400000` = AAC-LC/44.1 kHz/24-bit/2ch, `0x800000` = AAC-LC/48 kHz). They are here for
+         * the sender's benefit, not because this receiver can decode them yet: Apple Music reads
+         * this mask before it will set up a stream at all, and a mask with only ALAC in it makes
+         * it stay in "session open, nothing playing" forever. If the log then shows it asking for
+         * AAC, that is the confirmation — not a surprise.
+         */
+        private const val BUFFER_STREAM_FORMATS = 0x40000L or 0x400000L or 0x800000L
+
         /** `pi` is a stable UUID derived from the device id, the same one the TXT record carries. */
         fun pairingId(deviceId: String): String = UUID.nameUUIDFromBytes(
             MessageDigest.getInstance("SHA-256").digest("ap2:$deviceId".toByteArray()).copyOf(16),
@@ -209,11 +221,12 @@ class Ap2Session(
             "volumeControlType" to 3L,
             "senderAddress" to sender(),
             // What the sender is allowed to send for a buffered stream, and what it can send live.
-            // Only ALAC/16/44.1 is listed: the decoder is ALAC-only, so naming AAC here would just
-            // talk the sender into a format that arrives as noise.
+            // `audioStream` names only ALAC/16/44.1: the decoder is ALAC-only, so naming AAC there
+            // would talk the sender into a format that arrives as noise. `bufferStream` carries
+            // the AAC entries as well — see BUFFER_STREAM_FORMATS for why.
             "supportedFormats" to linkedMapOf<String, Any?>(
                 "audioStream" to AUDIO_STREAM_FORMATS,
-                "bufferStream" to AUDIO_STREAM_FORMATS,
+                "bufferStream" to BUFFER_STREAM_FORMATS,
             ),
             "playbackCapabilities" to linkedMapOf<String, Any?>(
                 "supportsInterstitials" to false,
