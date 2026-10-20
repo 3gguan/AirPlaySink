@@ -3,6 +3,15 @@ package com.shilapi.airplaysink
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
+ * Which AirPlay generation a session actually negotiated.
+ *
+ * Not the same thing as the configured one: a sender that still has an `_airplay` record cached
+ * will speak AirPlay 2 to a receiver set to RAOP, and the status card has to show what happened
+ * rather than what was asked for.
+ */
+enum class SinkProtocol { AP1, AP2 }
+
+/**
  * The one piece of shared state the UI renders. The service writes, the activity reads.
  */
 object SinkModel {
@@ -16,6 +25,8 @@ object SinkModel {
         val adverisedName: String? = null,
         val port: Int = 0,
         val client: String? = null,
+        /** The generation the connected sender is speaking; null while nobody is connected. */
+        val protocol: SinkProtocol? = null,
         val streaming: Boolean = false,
         val title: String? = null,
         val artist: String? = null,

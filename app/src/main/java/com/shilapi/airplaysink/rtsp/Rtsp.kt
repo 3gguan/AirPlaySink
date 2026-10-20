@@ -65,6 +65,7 @@ class RtspResponse(val status: Int) {
         453 -> "Not Enough Bandwidth"
         454 -> "Session Not Found"
         456 -> "Header Field Not Valid for Resource"
+        470 -> "Connection Authorization Required"
         500 -> "Internal Server Error"
         else -> "OK"
     }

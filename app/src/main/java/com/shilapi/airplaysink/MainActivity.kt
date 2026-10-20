@@ -46,6 +46,7 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
 
     private lateinit var rootScroll: ScrollView
     private lateinit var serviceSwitch: SwitchCompat
+    private lateinit var protocolSwitch: SwitchCompat
     private lateinit var bootSwitch: SwitchCompat
     private lateinit var batteryState: TextView
     private lateinit var batteryApplyButton: Button
@@ -97,6 +98,7 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
 
         rootScroll = findViewById(R.id.rootScroll)
         serviceSwitch = findViewById(R.id.serviceSwitch)
+        protocolSwitch = findViewById(R.id.protocolSwitch)
         bootSwitch = findViewById(R.id.bootSwitch)
         deviceNameInput = findViewById(R.id.deviceNameInput)
         bufferSeek = findViewById(R.id.bufferSeek)
@@ -140,6 +142,14 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         bootSwitch.isChecked = preferences.startOnBoot
         bootSwitch.setOnCheckedChangeListener { _, checked ->
             preferences.startOnBoot = checked
+        }
+
+        protocolSwitch.isChecked = preferences.airPlay2
+        protocolSwitch.setOnCheckedChangeListener { _, checked ->
+            if (suppressSwitchCallback) return@setOnCheckedChangeListener
+            if (checked == preferences.airPlay2) return@setOnCheckedChangeListener
+            preferences.airPlay2 = checked
+            applyProtocol()
         }
 
         batteryState = findViewById(R.id.batteryState)
@@ -263,6 +273,7 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
             R.string.ui_address,
             R.string.ui_advertised_name,
             R.string.ui_port,
+            R.string.ui_protocol,
             R.string.ui_client,
             R.string.ui_now_playing,
             R.string.ui_volume,
@@ -335,6 +346,7 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
             R.string.ui_port,
             if (state.port > 0) state.port.toString() else getString(R.string.ui_empty),
         )
+        setRow(R.string.ui_protocol, describeProtocol(state))
         setRow(R.string.ui_client, state.client ?: getString(R.string.ui_empty))
         setRow(R.string.ui_now_playing, describeTrack(state))
         setRow(R.string.ui_volume, describeVolume(state))
@@ -356,6 +368,29 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         // The service reports the cushion it actually started with, so the label can say when the
         // slider has moved somewhere the running receiver has not caught up with yet.
         renderBufferLabel()
+    }
+
+    /**
+     * What the connected sender is speaking, falling back to what the switch asks for.
+     *
+     * The two can differ: iOS keeps an `_airplay` record cached for up to 75 minutes, so a device
+     * switched back to RAOP can still be opened over AirPlay 2 for a while. Showing the session is
+     * the only way that difference is ever noticed.
+     */
+    private fun describeProtocol(state: SinkModel.State): String {
+        val live = state.protocol
+        val configured = if (preferences.airPlay2) SinkProtocol.AP2 else SinkProtocol.AP1
+        val name = getString(
+            when (live ?: configured) {
+                SinkProtocol.AP2 -> R.string.ui_protocol_ap2
+                SinkProtocol.AP1 -> R.string.ui_protocol_ap1
+            },
+        )
+        return when {
+            live != null -> getString(R.string.ui_protocol_active, name)
+            state.running -> getString(R.string.ui_protocol_waiting, name)
+            else -> getString(R.string.ui_protocol_idle, name)
+        }
     }
 
     private fun describeTrack(state: SinkModel.State): String {
@@ -488,6 +523,24 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         val exact = choices.indexOf(ms)
         if (exact >= 0) return exact
         return choices.indices.minByOrNull { kotlin.math.abs(choices[it] - ms) } ?: 0
+    }
+
+    // ------------------------------------------------------------------ protocol
+
+    /**
+     * Which protocol is served decides which records are published, and the advertisement is fixed
+     * when the receiver starts — so the switch bounces the service, exactly like the name and the
+     * cushion. Turning AirPlay 2 off also makes the restart send a goodbye for the old record; that
+     * is what stops the phone from pairing against a receiver that no longer answers.
+     */
+    private fun applyProtocol() {
+        if (!SinkService.isActive) {
+            setRow(R.string.ui_protocol, describeProtocol(SinkModel.state))
+            return
+        }
+        toast(getString(R.string.ui_airplay2_applied))
+        SinkService.stop(this)
+        rootScroll.postDelayed({ SinkService.start(this) }, RESTART_DELAY_MS)
     }
 
     // ------------------------------------------------------------------ device name

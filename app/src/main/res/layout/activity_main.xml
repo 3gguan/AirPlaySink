@@ -39,6 +39,24 @@
             android:textColor="@color/sink_text"
             android:textSize="17sp" />
 
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/protocolSwitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:minHeight="48dp"
+            android:text="@string/ui_airplay2"
+            android:textColor="@color/sink_text"
+            android:textSize="15sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:lineSpacingExtra="2dp"
+            android:text="@string/ui_airplay2_hint"
+            android:textColor="@color/sink_text_dim"
+            android:textSize="12sp" />
+
         <LinearLayout
             android:id="@+id/statusCard"
             android:layout_width="match_parent"

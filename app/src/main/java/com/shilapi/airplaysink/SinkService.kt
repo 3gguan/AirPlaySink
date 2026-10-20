@@ -222,6 +222,7 @@ class SinkService : Service(), RaopEvents {
             firmwareVersion = Build.VERSION.RELEASE ?: "android",
             localAddress = endpoint.address,
             cushionMs = preferences.bufferMs,
+            airPlay2 = preferences.airPlay2,
         )
         SinkModel.update { it.copy(bufferMs = config.cushionMs) }
 
@@ -321,6 +322,7 @@ class SinkService : Service(), RaopEvents {
                 starting = false,
                 waitingForNetwork = false,
                 client = null,
+                protocol = null,
                 streaming = false,
                 title = null,
                 artist = null,
@@ -381,6 +383,17 @@ class SinkService : Service(), RaopEvents {
         updateNotification("Connected: $peer")
     }
 
+    /**
+     * What the sender turned out to speak. The switch decides what is advertised; a sender with a
+     * cached record can still pick the other one, so the notification and the status card report
+     * the session rather than the setting.
+     */
+    override fun onProtocolNegotiated(protocol: SinkProtocol) {
+        val label = if (protocol == SinkProtocol.AP2) "AirPlay 2" else "AirPlay 1"
+        SinkModel.update { it.copy(protocol = protocol) }
+        updateNotification("Connected: $label")
+    }
+
     override fun onClientDisconnected() {
         // The DACP endpoint is deliberately *not* thrown away. iOS closes the control connection
         // right after its OPTIONS probe and only reconnects when the user actually starts playing,
@@ -390,6 +403,7 @@ class SinkService : Service(), RaopEvents {
         SinkModel.update {
             it.copy(
                 client = null,
+                protocol = null,
                 streaming = false,
                 title = null,
                 artist = null,

@@ -1,7 +1,9 @@
 package com.shilapi.airplaysink.raop
 
 import android.content.Context
+import com.shilapi.airplaysink.net.Ap2Advertiser
 import com.shilapi.airplaysink.net.MdnsAdvertiser
+import com.shilapi.airplaysink.net.MdnsGoodbye
 import com.shilapi.airplaysink.util.SinkLog
 import java.io.Closeable
 import java.net.InetSocketAddress
@@ -34,9 +36,22 @@ class RaopReceiver(
     @Volatile
     private var running = false
 
+    /**
+     * Whether this run serves the AirPlay 2 message set on the control connection.
+     *
+     * Taken from the configuration, which the service fills from the user's switch, and used twice:
+     * to decide whether the `_airplay._tcp` record is published, and whether `/info` and the pairing
+     * endpoints are answered. Both sides have to agree — a published record without the handlers is
+     * a device that pairs and then hangs up, and handlers without the record are never reached.
+     */
+    private val ap2Enabled: Boolean get() = config.airPlay2
+
     private var serverSocket: ServerSocket? = null
     private var advertiser: MdnsAdvertiser? = null
     private var acceptThread: Thread? = null
+
+    /** The AirPlay 2 identity; null when AirPlay 2 is off. Never touches the RAOP path. */
+    private var ap2Advertiser: Ap2Advertiser? = null
 
     @Volatile
     private var currentSession: RaopSession? = null
@@ -46,6 +61,19 @@ class RaopReceiver(
     /** Binds the control port and starts advertising. Throws when nothing can be bound. */
     fun start() {
         if (running) return
+
+        if (!ap2Enabled) {
+            // A previous run published `_airplay._tcp`, and a sender caches that record for its
+            // full TTL. Until it expires the iPhone treats this device as AirPlay 2, pairs against
+            // a receiver that is not answering, and reports "unable to connect" — even though the
+            // RAOP advertisement beside it is perfectly good. Retracting it explicitly is the
+            // difference between "works again" and "works again in an hour".
+            MdnsGoodbye.withdrawAsync(
+                config.instanceName,
+                Ap2Advertiser.SERVICE_TYPE,
+                config.localAddress,
+            )
+        }
 
         val socket = bindControlSocket()
         serverSocket = socket
@@ -62,6 +90,26 @@ class RaopReceiver(
             "AirPlay receiver listening on port ${socket.localPort} " +
                 "as \"${config.deviceName}\" (all interfaces)",
         )
+
+        startAp2IfEnabled()
+    }
+
+    /**
+     * Publishes the AirPlay 2 identity beside the RAOP advertisement, when the switch asks for it.
+     *
+     * Wrapped so a failure here can never take the working receiver down with it.
+     */
+    private fun startAp2IfEnabled() {
+        if (!ap2Enabled) return
+        val port = serverSocket?.localPort ?: return
+        runCatching {
+            Ap2Advertiser(appContext, config).also {
+                it.start(port)
+                ap2Advertiser = it
+            }
+        }.onFailure {
+            SinkLog.w("AP2: could not advertise (${it.message}); RAOP is unaffected")
+        }
     }
 
     private fun bindControlSocket(): ServerSocket {
@@ -139,6 +187,8 @@ class RaopReceiver(
 
     override fun close() {
         running = false
+        ap2Advertiser?.let { runCatching { it.close() } }
+        ap2Advertiser = null
         runCatching { currentSession?.close() }
         currentSession = null
         runCatching { serverSocket?.close() }

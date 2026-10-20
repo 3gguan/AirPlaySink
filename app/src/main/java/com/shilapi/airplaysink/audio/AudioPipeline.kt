@@ -221,6 +221,7 @@ class AudioPipeline(
     private var nextSequence = -1L
     private var firstPacketAt = 0L
     private var decodedPackets = 0L
+    private var receivedPackets = 0L
     private var skippedPackets = 0L
 
     /** The RTP timestamp carried by the first packet, and its sequence — the timeline anchor. */
@@ -373,6 +374,7 @@ class AudioPipeline(
 
     fun submit(sequence: Long, rtpTime: Long, payload: ByteArray) {
         synchronized(lock) {
+            receivedPackets++
             if (nextSequence >= 0L && sequence < nextSequence) {
                 // Its moment has already been played, so there is nowhere to put it. Counted
                 // rather than stored: see [tooLatePackets].
@@ -508,6 +510,7 @@ class AudioPipeline(
             gapSince = 0L
             pendingConceal = 0
             decodedPackets = 0L
+            receivedPackets = 0L
             skippedPackets = 0L
             recoveredPackets = 0L
             tooLatePackets = 0L
@@ -566,6 +569,10 @@ class AudioPipeline(
             val samples = decoder.decodeFrame(body, 0, body.size, out)
             if (samples <= 0) {
                 SinkLog.w("Dropping undecodable ALAC frame (${decoder.lastError})")
+                // A stream that fails to decode used to be described by nothing but this warning:
+                // the stats below sat behind a successful write, so the one case where they matter
+                // most was the one case that never printed them.
+                reportStatsIfDue()
                 continue
             }
             val player = track ?: continue
@@ -856,16 +863,19 @@ class AudioPipeline(
         lastStatsAt = now
         val queued: Int
         val bufferedMs: Long
+        val received: Long
         synchronized(lock) {
             queued = pending.size
             bufferedMs = bufferedFramesLocked() * 1000 / sampleRate
+            received = receivedPackets
         }
         // `buffered` is the audible safety margin: the audio in hand, which is both what a gap is
         // waited for and what a network stall has to burn through before the speaker goes quiet.
         // `underruns` is the AudioTrack's own count of the times it got there — if that number is
         // climbing, the stutter is real and it is starvation, not congestion.
         val underruns = runCatching { track?.underrunCount ?: 0 }.getOrDefault(0)
-        val stats = "decoded $decodedPackets packets, skipped $skippedPackets, " +
+        val stats = "received $received packets, decoded $decodedPackets, " +
+            "skipped $skippedPackets, " +
             "recovered $recoveredPackets, concealed $concealedPackets, tooLate $tooLatePackets, " +
             "queued $queued, buffered ${bufferedMs}ms, underruns $underruns"
         SinkLog.i(stats)

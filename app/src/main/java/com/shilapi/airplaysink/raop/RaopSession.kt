@@ -1,5 +1,10 @@
 package com.shilapi.airplaysink.raop
 
+import com.shilapi.airplaysink.SinkProtocol
+import com.shilapi.airplaysink.ap2.Ap2SecureLink
+import com.shilapi.airplaysink.ap2.Ap2Session
+import com.shilapi.airplaysink.ap2.Ap2Streams
+import com.shilapi.airplaysink.ap2.BPlistReader
 import com.shilapi.airplaysink.audio.AudioPipeline
 import com.shilapi.airplaysink.audio.DmapReader
 import com.shilapi.airplaysink.audio.RaopAudioTransport
@@ -13,6 +18,7 @@ import com.shilapi.airplaysink.rtsp.RtspResponse
 import com.shilapi.airplaysink.rtsp.SdpParser
 import com.shilapi.airplaysink.rtsp.textBody
 import com.shilapi.airplaysink.rtsp.writeRtsp
+import com.shilapi.airplaysink.util.Codec
 import com.shilapi.airplaysink.util.SinkLog
 import java.io.Closeable
 import java.io.InputStream
@@ -27,6 +33,14 @@ import kotlin.math.pow
 /** What the UI and the service want to know about a session. */
 interface RaopEvents {
     fun onClientConnected(peer: String)
+
+    /**
+     * The generation this connection turned out to speak.
+     *
+     * Reported once per connection at the first request that can only belong to one of them: an
+     * ANNOUNCE means RAOP, `/info` or `/pair-setup` means AirPlay 2.
+     */
+    fun onProtocolNegotiated(protocol: SinkProtocol)
     fun onClientDisconnected()
     fun onStreamingStarted()
     fun onStreamingStopped()
@@ -62,6 +76,12 @@ data class RaopServerConfig(
     val firmwareVersion: String,
     val localAddress: InetAddress,
     /**
+     * Whether this run answers the AirPlay 2 message set as well as RAOP.
+     *
+     * Fixed when the receiver starts, because it also decides which mDNS records are published.
+     */
+    val airPlay2: Boolean = true,
+    /**
      * How much audio the receiver holds in front of the speaker, i.e. its own latency.
      *
      * The sender is told this number twice — once as the `Audio-Latency` header of the RECORD
@@ -83,6 +103,16 @@ class RaopSession(
     private val events: RaopEvents,
     private val onFinished: (RaopSession) -> Unit,
 ) : Closeable {
+
+    /**
+     * Whether the AirPlay 2 message set is served on this connection.
+     *
+     * When false, `/info` and `/pair-setup` fall through to the RAOP handlers and the sender stays
+     * on classic RAOP. Answering them commits a sender to a protocol whose streaming half may not
+     * be what it wants, and the failure mode is "unable to connect" with no fallback — so the
+     * choice has to be explicit, not a guess.
+     */
+    private val ap2Enabled: Boolean get() = config.airPlay2
 
     private companion object {
         /** What the AirPort Express reports after RECORD: 250 ms at 44.1 kHz. The floor for ours. */
@@ -123,9 +153,40 @@ class RaopSession(
             }
     }
 
-    private val input: InputStream = socket.getInputStream()
-    private val output: OutputStream = socket.getOutputStream()
+    /**
+     * The socket's own streams, and the pair the rest of this class actually talks to.
+     *
+     * AirPlay 2 encrypts the control connection in place once pairing has produced a key, so the
+     * reader keeps a handle to a switchable wrapper rather than to the socket: swapping what is
+     * behind it turns every subsequent byte — including the ones this class writes — into HAP
+     * frames, without the RTSP layer knowing.
+     */
+    private val rawInput: InputStream = socket.getInputStream()
+    private val rawOutput: OutputStream = socket.getOutputStream()
+    private val input = SwitchableInput(rawInput)
+    private val output = SwitchableOutput(rawOutput)
     private val reader = RtspReader(input)
+
+    /** Pairing state for this connection; harmless and unused while the sender speaks RAOP. */
+    private val ap2 = Ap2Session(config) { peerDescription }
+
+    /**
+     * The AirPlay 2 audio path, built on the first `SETUP` that names streams.
+     *
+     * Null until then, and unused entirely when [ap2Enabled] is false — the RAOP stream has its own
+     * UDP transport further down this file.
+     */
+    private var ap2Streams: Ap2Streams? = null
+
+    /** The pairing secret, kept because the event channel derives its own keys from it. */
+    private var ap2Secret: ByteArray? = null
+
+    @Volatile
+    private var encrypted = false
+
+    /** What the UI has already been told about this connection; null until the first proof. */
+    @Volatile
+    private var reportedProtocol: SinkProtocol? = null
 
     /** Same string the TXT record advertises as `vs`; every AirTunes-compatible box answers this. */
     private val serverName: String get() = "AirTunes/${config.serverVersion}"
@@ -227,6 +288,24 @@ class RaopSession(
 
     private fun handle(request: RtspRequest) {
         observeDacpHeaders(request)
+
+        // AirPlay 2 uses the same connection as RAOP but a different message set: `/info` and the
+        // HAP pairing endpoints are paths, not RTSP URIs, so they cannot collide with anything the
+        // RAOP side handles.
+        if (ap2Enabled && ap2.handles(request.uri)) {
+            reportProtocol(SinkProtocol.AP2)
+            val response = ap2.handle(request)
+            respond(request, response)
+            // The reply itself is still plaintext; the encryption starts with whatever the sender
+            // sends next. shairport-sync sequences it exactly this way.
+            ap2.takePendingSharedSecret()?.let { upgradeToEncrypted(it) }
+            return
+        }
+
+        // Past pairing the sender is committed to AirPlay 2: its SETUP carries a plist instead of a
+        // Transport header, so the RAOP handlers below would reject every one of them.
+        if (ap2Enabled && encrypted && handleAp2(request)) return
+
         when (request.method.uppercase()) {
             "OPTIONS" -> respond(request, optionsResponse())
             "ANNOUNCE" -> respond(request, announceResponse(request))
@@ -248,9 +327,46 @@ class RaopSession(
             }
             else -> {
                 SinkLog.i("${request.method} from $peerDescription answered with 200")
+                // AirPlay 2 handshakes arrive here as `GET /info` and `POST /pair-setup`. Until the
+                // pairing code exists these are answered with an empty body, so the bytes are the
+                // only record of what the sender actually asked for.
+                if (request.content.isNotEmpty()) {
+                    // `/command` is a 1.2 kB binary plist that repeats every two seconds. Dumping
+                    // it as hex cost a megabyte of log per quarter of an hour and said nothing a
+                    // decoded summary cannot, so plists are described and only anything else is
+                    // shown as hex, capped.
+                    val described = safePlist(request.content)
+                    if (described != null) {
+                        SinkLog.i(
+                            "  ${request.method} ${request.uri} plist: " +
+                                BPlistReader.describe(described),
+                        )
+                    } else {
+                        SinkLog.i(
+                            "  ${request.method} ${request.uri} body: " +
+                                Codec.toHex(request.content).take(400),
+                        )
+                    }
+                }
                 respond(request, RtspResponse(200))
             }
         }
+    }
+
+    /**
+     * Reports the generation this connection speaks, once.
+     *
+     * Several requests prove it — `/info` and the pairing endpoints for AirPlay 2, `ANNOUNCE` for
+     * RAOP, then every encrypted request after pairing — but a connection can only ever be one of
+     * them, so the UI is woken at the first proof and not again.
+     */
+    private fun reportProtocol(protocol: SinkProtocol) {
+        if (reportedProtocol == protocol) return
+        reportedProtocol = protocol
+        SinkLog.i(
+            "Protocol: ${if (protocol == SinkProtocol.AP2) "AirPlay 2" else "AirPlay 1 (RAOP)"}",
+        )
+        events.onProtocolNegotiated(protocol)
     }
 
     /**
@@ -268,6 +384,147 @@ class RaopSession(
             "Remote control offered: DACP-ID=${dacpId ?: "-"} Active-Remote=${activeRemote ?: "-"}",
         )
         events.onDacpCredentials(dacpId, activeRemote, socket.inetAddress)
+    }
+
+    // ------------------------------------------------------------------ AirPlay 2
+
+    /**
+     * Serves the AirPlay 2 methods that differ from their RAOP namesakes.
+     *
+     * Returns false for everything else, which then goes through the RAOP handlers — `OPTIONS`,
+     * `SET_PARAMETER` (volume and metadata travel as text and DMAP in both protocols) and
+     * `GET_PARAMETER` are genuinely the same on the wire.
+     */
+    private fun handleAp2(request: RtspRequest): Boolean {
+        // Reaching here means pairing produced a key, which only AirPlay 2 does.
+        reportProtocol(SinkProtocol.AP2)
+        when (request.method.uppercase()) {
+            "SETUP" -> {
+                if (request.content.isEmpty()) return false // a RAOP SETUP; let it through
+                respond(request, ap2Setup(request))
+            }
+            "RECORD" -> respond(request, ap2Record(request))
+            "FLUSH" -> {
+                pipeline?.flush()
+                SinkLog.i("AP2: FLUSH — dropped buffered audio")
+                respond(request, RtspResponse(200))
+            }
+            // Playback timing. This receiver plays from its own clock and does not align with other
+            // AirPlay 2 devices, so the anchor is acknowledged rather than applied.
+            "SETRATEANCHORI", "SETRATEANCHOR", "SETPEERS", "SETPEER", "REMOVEPEER" -> {
+                if (request.content.isNotEmpty()) {
+                    SinkLog.i(
+                        "AP2: ${request.method} ${request.content.size}B " +
+                            BPlistReader.describe(safePlist(request.content)),
+                    )
+                }
+                respond(request, RtspResponse(200))
+            }
+            else -> return false
+        }
+        return true
+    }
+
+    /** A plist the caller is about to describe in the log; null rather than an exception. */
+    private fun safePlist(bytes: ByteArray): Any? = try {
+        BPlistReader.parse(bytes)
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun ap2Setup(request: RtspRequest): RtspResponse {
+        val plist = try {
+            BPlistReader.parseDictionary(request.content)
+        } catch (error: Exception) {
+            SinkLog.e("AP2: SETUP body is not a readable bplist: ${error.message}")
+            null
+        }
+        if (plist == null) {
+            SinkLog.w("AP2: SETUP without a usable plist; falling back to the RAOP handler")
+            return setupResponse(request)
+        }
+
+        val streams = ap2Streams ?: createAp2Streams().also { ap2Streams = it }
+        val body = streams.setup(plist) ?: return RtspResponse(451)
+        SinkLog.i("AP2: SETUP answered with ${body.size}B bplist")
+        return RtspResponse(200)
+            .addHeader("Content-Type", "application/x-apple-binary-plist")
+            .also { it.content = body }
+    }
+
+    /**
+     * `RECORD` opens the session; the audio itself arrives on the TCP port from the second SETUP.
+     *
+     * The order is the sender's, not ours: it records before it names the streams, so a RECORD
+     * with no stream yet is the normal case and must be answered, not refused. Refusing it here is
+     * what made the sender treat the whole session as unsupported and hang up.
+     *
+     * `Audio-Latency: 0` is what the working implementations return; AirPlay 2 states the real
+     * latency in the timing anchor instead.
+     */
+    private fun ap2Record(request: RtspRequest): RtspResponse {
+        if (request.content.isNotEmpty()) {
+            SinkLog.i(
+                "AP2: RECORD ${request.content.size}B ${BPlistReader.describe(safePlist(request.content))}",
+            )
+        }
+        val audioPipeline = pipeline
+        if (audioPipeline == null) {
+            SinkLog.i("AP2: RECORD — session open, waiting for the stream SETUP")
+        } else if (!streaming) {
+            audioPipeline.start()
+            audioPipeline.setVolume(currentLinearVolume)
+            streaming = true
+            events.onStreamingStarted()
+            SinkLog.i(
+                String.format(
+                    java.util.Locale.US,
+                    "AP2: RECORD — playback started at gain %.4f (%.2f dB)",
+                    currentLinearVolume,
+                    volumeDb,
+                ),
+            )
+        }
+        return RtspResponse(200).addHeader("Audio-Latency", "0")
+    }
+
+    private fun createAp2Streams(): Ap2Streams {
+        val secret = ap2Secret
+        if (secret == null) {
+            SinkLog.w("AP2: a stream was set up without a pairing secret; audio stays unencrypted")
+        }
+        return Ap2Streams(
+            localAddress = socket.localAddress,
+            sharedSecret = secret ?: ByteArray(0),
+            onFormat = { format ->
+                SinkLog.i(
+                    "AP2: audio format ${format.sampleRate}Hz ${format.channels}ch " +
+                        "spf=${format.framesPerPacket} ct=${format.compressionType} " +
+                        "audioFormat=0x%08X".format(format.audioFormat),
+                )
+                pipeline = AudioPipeline(
+                    sampleRate = format.sampleRate.coerceIn(8000, 96000),
+                    channels = format.channels.coerceIn(1, 2),
+                    framesPerPacket = format.framesPerPacket.coerceIn(16, 4096),
+                    cushionMs = config.cushionMs,
+                )
+            },
+            onAudio = { sequence, timestamp, payload ->
+                val audioPipeline = pipeline
+                if (audioPipeline != null) {
+                    // A sender may open the data port before it sends RECORD. Starting here keeps
+                    // the first second of audio from being dropped while waiting for it.
+                    if (!streaming) {
+                        audioPipeline.start()
+                        audioPipeline.setVolume(currentLinearVolume)
+                        streaming = true
+                        events.onStreamingStarted()
+                        SinkLog.i("AP2: playback started on the first audio frame")
+                    }
+                    audioPipeline.submit(sequence, timestamp, payload)
+                }
+            },
+        )
     }
 
     private fun optionsResponse(): RtspResponse = RtspResponse(200)
@@ -317,6 +574,9 @@ class RaopSession(
             SinkLog.e("The sender chose AAC, which this audio sink does not decode; audio will be silent")
         }
 
+        // A readable ANNOUNCE is the point where this is provably RAOP: AirPlay 2 never sends one,
+        // it describes its streams in a plist SETUP instead.
+        reportProtocol(SinkProtocol.AP1)
         return RtspResponse(200)
             .addHeader("Audio-Jack-Status", "connected; type=analog")
     }
@@ -522,6 +782,23 @@ class RaopSession(
 
     // ------------------------------------------------------------------ plumbing
 
+    /**
+     * Switches the control connection to HAP framing.
+     *
+     * Called once, right after the pairing reply has been written. Anything still buffered in the
+     * reader would be plaintext by definition — the sender cannot have sent encrypted bytes before
+     * it saw our reply — so the swap is safe as long as it happens between two requests.
+     */
+    private fun upgradeToEncrypted(sharedSecret: ByteArray) {
+        if (encrypted) return
+        ap2Secret = sharedSecret
+        val link = Ap2SecureLink(rawInput, rawOutput, sharedSecret)
+        input.delegate = link.input
+        output.delegate = link.output
+        encrypted = true
+        SinkLog.i("AP2: control channel switched to encrypted frames")
+    }
+
     private fun respond(request: RtspRequest, response: RtspResponse) {
         // Answer the challenge on the way out, for every method. shairport-sync does exactly this
         // and senders are known to hang up silently when the response is missing.
@@ -593,6 +870,8 @@ class RaopSession(
     private fun teardownSession(@Suppress("UNUSED_PARAMETER") sendResponse: Boolean) {
         val wasStreaming = streaming
         streaming = false
+        ap2Streams?.let { runCatching { it.close() } }
+        ap2Streams = null
         releaseAudioResources()
         if (wasStreaming) events.onStreamingStopped()
         announce = null
@@ -606,4 +885,26 @@ private fun String.intValueAfter(marker: String): Int? {
     val rest = substring(index + marker.length)
     val digits = rest.takeWhile { it.isDigit() }
     return digits.toIntOrNull()
+}
+
+/**
+ * An [InputStream] whose source can be replaced while readers keep their reference.
+ *
+ * AirPlay 2 needs this because the control connection is upgraded in place: [RtspReader] is built
+ * once with the plaintext socket stream, and after pairing the same object must return decrypted
+ * bytes from the HAP frame reader.
+ */
+private class SwitchableInput(var delegate: InputStream) : InputStream() {
+    override fun read(): Int = delegate.read()
+    override fun read(b: ByteArray, off: Int, len: Int): Int = delegate.read(b, off, len)
+    override fun available(): Int = delegate.available()
+    override fun close() = delegate.close()
+}
+
+/** The write side of [SwitchableInput]. */
+private class SwitchableOutput(var delegate: OutputStream) : OutputStream() {
+    override fun write(b: Int) = delegate.write(b)
+    override fun write(b: ByteArray, off: Int, len: Int) = delegate.write(b, off, len)
+    override fun flush() = delegate.flush()
+    override fun close() = delegate.close()
 }

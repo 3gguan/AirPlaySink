@@ -40,6 +40,22 @@ class SinkPreferences(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_START_ON_BOOT, value).apply()
 
     /**
+     * Whether to serve AirPlay 2 instead of classic RAOP.
+     *
+     * Both generations use the same control port; the choice only decides which records are
+     * published and whether `/info` and the HAP pairing endpoints are answered. AirPlay 2 is the
+     * default because its senders end the session properly — the phone releases the output the
+     * moment the user switches away, instead of going on showing "connected" after the sink has
+     * stopped. RAOP stays one switch away: it retransmits lost packets, which is worth having on a
+     * link that drops them.
+     *
+     * Read when the receiver starts, so a change lands on the next start.
+     */
+    var airPlay2: Boolean
+        get() = prefs.getBoolean(KEY_AIRPLAY2, DEFAULT_AIRPLAY2)
+        set(value) = prefs.edit().putBoolean(KEY_AIRPLAY2, value).apply()
+
+    /**
      * How much audio to hold in front of the speaker, in milliseconds.
      *
      * The receiver's latency and its tolerance for a stalling link are the same number, so this is
@@ -83,6 +99,7 @@ class SinkPreferences(context: Context) {
         private const val KEY_STATUS_FLAGS = "status_flags"
         private const val KEY_SERVICE_ENABLED = "service_enabled"
         private const val KEY_START_ON_BOOT = "start_on_boot"
+        private const val KEY_AIRPLAY2 = "airplay2"
         private const val KEY_BUFFER_MS = "buffer_ms"
 
         /**
@@ -107,5 +124,8 @@ class SinkPreferences(context: Context) {
 
         /** `sf` bit 2 means "audio cable is attached", the value an audio-only AirPort reports. */
         const val DEFAULT_STATUS_FLAGS = 0x4
+
+        /** AirPlay 2 unless the user picks otherwise; see [airPlay2]. */
+        const val DEFAULT_AIRPLAY2 = true
     }
 }
