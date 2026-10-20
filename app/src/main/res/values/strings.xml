@@ -14,7 +14,7 @@
     <string name="ui_start_on_boot">开机后自动开启</string>
 
     <string name="ui_airplay2">使用 AirPlay 2</string>
-    <string name="ui_airplay2_hint">关闭后回到 AirPlay 1（RAOP）。AirPlay 2 断开时手机会主动结束会话；AirPlay 1 会重传丢失的音频包，链路不稳时更耐抖。切换会重启服务。</string>
+    <string name="ui_airplay2_hint">关闭后回到 AirPlay 1（RAOP）。AirPlay 2 断开时手机会主动结束会话，但没有反向控制：苹果在 AP2 下不再下发 DACP 凭据，方向盘和界面上的上一首 / 播放暂停 / 下一首都会失效。AirPlay 1 保留这三个键，且会重传丢失的音频包。切换会重启服务。</string>
     <string name="ui_airplay2_applied">协议已切换，正在重启服务</string>
 
     <string name="ui_battery">后台保活</string>
@@ -63,6 +63,7 @@ adb shell appops set com.shilapi.airplaysink SYSTEM_ALERT_WINDOW allow</string>
     <string name="ui_remote_control">反向控制</string>
     <string name="ui_remote_control_ready">可用</string>
     <string name="ui_remote_control_pending">等待 iPhone 提供</string>
+    <string name="ui_remote_control_ap2">不可用 · AirPlay 2 下苹果已取消这条通道</string>
     <string name="ui_empty">—</string>
 
     <string name="ui_control_previous">上一首</string>
@@ -70,6 +71,11 @@ adb shell appops set com.shilapi.airplaysink SYSTEM_ALERT_WINDOW allow</string>
     <string name="ui_control_next">下一首</string>
     <string name="ui_control_sent">已发送：%1$s</string>
     <string name="ui_control_unavailable">反向控制暂不可用，请先让 iPhone 连上本车机</string>
+    <string name="ui_control_ap2_title">AirPlay 2 不能反向控制</string>
+    <string name="ui_control_ap2_message">上一首 / 播放暂停 / 下一首 走的都是 DACP——iPhone 在 AirPlay 1 的 RTSP 请求里附带 DACP-ID 与 Active-Remote，接收端才被授权去遥控它。\n\n升级到 AirPlay 2 之后苹果不再下发这两个头，遥控改走未公开的加密通道（MRP），第三方接收端至今无解，shairport-sync 在 AP2 下同样是「No Remote Control」。\n\n只放音频不受影响。切回 AirPlay 1 后这三个键（含方向盘）立刻恢复，代价是接收端断开时 iPhone 不会马上结束会话。切换会重启服务，之后要在 iPhone 上重新选一次输出。</string>
+    <string name="ui_control_ap2_switch">切回 AirPlay 1</string>
+    <string name="ui_control_ap2_keep">继续用 AirPlay 2</string>
+    <string name="ui_control_ap2_switched">已切回 AirPlay 1，请在 iPhone 上重新选择一次输出</string>
 
     <string name="ui_log">运行日志</string>
     <string name="ui_log_empty">（暂无日志）</string>

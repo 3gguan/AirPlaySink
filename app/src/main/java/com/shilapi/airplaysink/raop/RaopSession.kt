@@ -404,6 +404,14 @@ class RaopSession(
                 respond(request, ap2Setup(request))
             }
             "RECORD" -> respond(request, ap2Record(request))
+            // AirPlay 2 states the device volume as a bplist key instead of the `volume: -12.50`
+            // text line RAOP uses. Anything else in this method (DMAP artwork, text parameters)
+            // falls through to the shared handler, which is why a miss returns false.
+            "SET_PARAMETER" -> {
+                val level = ap2Volume(request) ?: return false
+                applyVolume(level)
+                respond(request, RtspResponse(200))
+            }
             "FLUSH" -> {
                 pipeline?.flush()
                 SinkLog.i("AP2: FLUSH — dropped buffered audio")
@@ -430,6 +438,34 @@ class RaopSession(
         BPlistReader.parse(bytes)
     } catch (_: Exception) {
         null
+    }
+
+    /**
+     * The volume carried by an AirPlay 2 `SET_PARAMETER`, or null when this request is not one.
+     *
+     * The value is the same AirPlay device volume RAOP sends as text — 0 dB at the top of the
+     * slider, -144 dB for mute — so it goes straight into [applyVolume]. Without this the phone's
+     * volume keys do nothing under AP2 while the status card goes on showing the last value RAOP
+     * left behind.
+     */
+    private fun ap2Volume(request: RtspRequest): Double? {
+        if (!request.contentType.lowercase().contains("plist")) return null
+        val plist = safePlist(request.content) as? Map<*, *> ?: return null
+        val level = when (val value = plist["volume"]) {
+            is Double -> value
+            is Float -> value.toDouble()
+            is Long -> value.toDouble()
+            is Int -> value.toDouble()
+            else -> return null
+        }
+        // 0 dB is the top of the scale and mute is -144 dB, so a positive number means the sender
+        // used some other unit. Refusing it leaves the current volume alone — clamping it to 0 dB
+        // would turn an unrecognised value into full blast, which is the one failure nobody wants.
+        if (level > 0.0) {
+            SinkLog.w("AP2: volume $level is above 0 dB, so it is not a dB value; ignoring it")
+            return null
+        }
+        return level
     }
 
     private fun ap2Setup(request: RtspRequest): RtspResponse {

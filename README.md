@@ -17,14 +17,14 @@
 | RTSP 控制：OPTIONS / ANNOUNCE / SETUP / RECORD / FLUSH / TEARDOWN / PAUSE / GET·SET_PARAMETER | ✅ |
 | DMAP 元数据（标题 / 艺术家 / 专辑）与 `progress:` | ✅ |
 | 音量控制（`volume: -xx.xx` dB） | ✅ |
-| **DACP 反向控制**（用方向盘 / 界面按钮遥控 iPhone 切歌、播放暂停） | ✅ |
+| **DACP 反向控制**（用方向盘 / 界面按钮遥控 iPhone 切歌、播放暂停） | ✅ 仅 **AirPlay 1**；AP2 下苹果已取消，见下文 |
 | 前台服务 + Wi-Fi Lock + Multicast Lock，息屏继续接收 | ✅ |
 | 开机自启（可选） | ✅ |
 | 进程被杀后自动恢复（START_STICKY + 网络事件拉起） | ✅ |
 | 电池优化豁免（界面申请 + adb 白名单说明） | ✅ |
 | 日志落盘文件（自动轮转） | ✅ |
+| **AirPlay 2 纯音频**（`_airplay._tcp` 广播、`/info`、transient pairing、加密控制通道、realtime + buffered 音频） | ✅ 默认开启；**但 AP2 下没有反向控制** |
 | **视频 / 屏幕镜像** | ❌ 全部去掉 |
-| **AirPlay 2（配对、`_airplay._tcp`）** | ❌ 故意不广播，避免 iOS 走 AP2 / CarPlay 协商 |
 | **USB / Wi-Fi Direct / 车机开热点 / VPN / 蓝牙 RFCOMM / iAP2 / MFi** | ❌ 全部去掉 |
 | 有线音频、多房间、AirPlay 密码（`pw=true`） | ❌ |
 
@@ -99,9 +99,9 @@ app/src/main/java/com/shilapi/airplaysink/
 
 Android 的 mDNS 由**系统守护进程 `mdnsd`** 统一代理（`NsdManager` 就是它的门面），它已经占着 UDP 5353。应用再自己开一个组播 socket 去做应答（jmdns、mDNSResponder 之类），在桌面端跑得好好的，到了很多定制 ROM 上会**一条查询都收不到** —— 表现就是"应用日志说广播成功了，但 iPhone 列表里什么都没有"。
 
-所以广播（`_raop._tcp`）和浏览（`_dacp._tcp`）**都走 `NsdManager`**，跟设备上其它服务用同一个 responder。
+所以广播（`_raop._tcp` / `_airplay._tcp`）和浏览（`_dacp._tcp`）**都走 `NsdManager`**，跟设备上其它服务用同一个 responder。
 
->`_raop._tcp` 只广播这一个类型是刻意的。广播 `_airplay._tcp` 会让 iOS 把本机当成 AirPlay 2 候选，去协商本项目没实现的配对流程 —— 更关键的是，**iOS 只在 classic（v1）模式下才发 DACP 头**，一旦它按 AP2 协商，方向盘按键的能力就一起没了。
+>`_airplay._tcp` 现在默认也广播（AP2 已实现，见「AirPlay 2」一节），但它是**二选一**的关系：一旦 iOS 按 AP2 协商，它就不再发 DACP 头，方向盘与界面上的上一首 / 播放暂停 / 下一首会一起失效。要这三个键，就把界面上的「使用 AirPlay 2」关掉，退回只广播 `_raop._tcp` 的 classic 模式。
 
 ### 两个真机上必须有的权限
 
@@ -181,10 +181,26 @@ adb shell cat /storage/emulated/0/Android/data/com.shilapi.airplaysink/files/sin
 ### DACP 反向控制（为什么只有这条路）
 
 AirPlay 本身是单向的：接收端只能回 RTSP 响应，协议里没有"让手机切歌"的方法。Apple 给音箱留的
-反向通道是 **DACP**（Digital Audio Control Protocol），而且它**只在 classic AirPlay 下有效** ——
-AirPlay 2 换成了 MRP（走加密 command channel），开源界至今没逆出来。
+反向通道是 **DACP**（Digital Audio Control Protocol），而且它**只在 classic AirPlay 下有效**。
 
-因为本项目只广播 `_raop._tcp`、不广播 `_airplay._tcp`，iOS 是按 classic 模式连的，
+原因不是"AP2 没实现 DACP"，而是**苹果在 AP2 里把授权凭据整个撤掉了**：`DACP-ID` 与
+`Active-Remote` 这两个头**只出现在 classic 的 RTSP 请求上**，一旦 iOS 按 AP2 协商，请求里就没有它们，
+接收端拿不到 token，`/ctrl-int/1/*` 发过去也只会被 iPhone 忽略。AP2 的遥控改走 MRP（媒体遥控协议），
+跑在一条用 HomeKit 种子派生的加密通道上，开源界至今没有逆出来。
+
+这不是本项目的判断，是整条开源链路的共识：
+
+- shairport-sync 维护者 mikebrady：*"With AirPlay 2, the DACP service no longer works and so no
+  remote control facilities will work"*（issue #1822 / #2186），项目文档里也写着 **No Remote Control**；
+- shairplay-rust 的 `AP2-STATUS.md` 把三条路都试过并写在结论里：MRP 需要 HomeKit 种子、
+  Companion-link 需要同一 Apple ID、DACP 在 AP2 下 iPhone 根本不发 `Active-Remote`。
+
+所以方向盘按键与 AP2 **只能二选一**，界面上把它做成了显式选择：AP2 会话下按这三个键会弹出说明，
+并给一个「切回 AirPlay 1」的按钮（切换会重启服务，之后要在 iPhone 上重选一次输出）。
+状态卡的「反向控制」一行在 AP2 下显示**不可用 · AirPlay 2 下苹果已取消这条通道**，
+不会再停在"等待 iPhone 提供"这种永远等不到的状态。
+
+因为本项目在 AirPlay 1 模式下只广播 `_raop._tcp`、不广播 `_airplay._tcp`，iOS 是按 classic 模式连的，
 **恰好落在 DACP 唯一还生效的那一侧**。
 
 流程：
@@ -205,6 +221,31 @@ AirPlay 2 换成了 MRP（走加密 command channel），开源界至今没逆�
    `nextitem` / `previtem`。
 
 实现依据：shairport-sync 的 `dacp.c` —— 请求拼串、端口发现方式、命令集都照它写。
+
+---
+
+## AirPlay 2（纯音频）
+
+界面上的「使用 AirPlay 2」开关决定广播哪套记录，默认开着。两代**共用同一个控制端口 5000**：
+`_airplay._tcp` 只是多一条身份，`/info` 与 HAP 配对端点都是同一条连接上的路径，没有第二个服务器。
+
+实现了什么：
+
+| 环节 | 实现 |
+| --- | --- |
+| 发现 | `_raop._tcp` + `_airplay._tcp`，TXT 里带 `pk` / `pi` / 特征位，两者必须一致 |
+| `/info` | 回完整设备描述 bplist（`features` / `supportedFormats` / `txtAirPlay` / `pi` …） |
+| 配对 | 只做 **transient pairing**（SRP-6a + M4 proof，固定码 `3939`），不做 `/pair-verify` |
+| 控制通道 | M4 之后整条 RTSP 切到 HAP 分帧：`uint16 长度 ‖ ChaCha20-Poly1305 ‖ tag`，双向独立密钥 |
+| 音频 | SETUP 两次：先开事件端口，再开流；`96` realtime（UDP RTP）与 `103` buffered（TCP 分帧），ALAC 解密后进同一条 `AudioPipeline` |
+| 音量 | `SET_PARAMETER` 的 bplist `volume`（dB，与 RAOP 的 `volume:` 文本行同量纲） |
+| 事件通道 | 在 `Events-Salt` 密钥下应答，事件内容目前只记录不处理 |
+
+刻意没做：**反向控制**（苹果已撤掉凭据，见上一节）、PTP 时钟同步（本机自己走自己的时钟，不参与多房间对齐）、
+HomeKit / `/pair-verify`（transient 配对够用，也不需要 Ed25519 身份）。
+
+> 已知取舍：AP2 音频默认走 TCP buffered，断线时发送端拿到的是硬失败，手机会主动结束会话；
+> 但代价就是方向盘那三个键没了。跑车机、靠方向盘切歌的场景，把开关关掉更实用。
 
 ---
 
@@ -305,9 +346,10 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 3. 状态卡会显示监听地址、广播名称、控制端口。显示「运行中，等待 iPhone」即可。
 4. iPhone 上打开控制中心 → 音频输出（或音乐 App 底部的 AirPlay 图标），在列表里选中本车机。
 5. 播放音频，车机音响出声。切歌时状态卡会显示标题 / 艺术家 / 专辑与进度。
-6. 手机一连上，状态卡的「反向控制」就会变成**可用**，界面上的「上一首 / 播放暂停 / 下一首」
+6. **AirPlay 1 会话**下，手机一连上状态卡的「反向控制」就会变成**可用**，界面上的「上一首 / 播放暂停 / 下一首」
    可以直接遥控 iPhone。同时应用开了一个 `MediaSession`，车机的媒体键也会转成 DACP 命令
-   发给 iPhone。
+   发给 iPhone。**AirPlay 2 会话**下这三条路都不通（协议限制），状态卡会写明原因，按任意一个键
+   会弹出说明并给出一键切回 AirPlay 1 的选项。
 
 开关状态会被记住：进程被系统杀掉后再打开 App，服务会自动恢复运行。
 
@@ -343,7 +385,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 方向盘按键：能到什么程度
 
-先把结论说清楚，免得期待错位。
+先把结论说清楚，免得期待错位。**这里的每一行都只对 AirPlay 1 成立** —— AP2 下苹果不再下发
+`DACP-ID` / `Active-Remote`，三个键一律无效（见「DACP 反向控制」一节）。
 
 | 键 | 后台（导航在前台） | App 界面在前台 |
 | --- | --- | --- |
@@ -380,7 +423,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | 偶尔「爆音／咔哒」 | 几乎总是**跳号**（`skipped` 在涨）—— 波形被硬接一刀。判断方法：听的时候盯 `skipped`，它每次 +1 就是一声。要减少它，得让缺口尽量被重传补回来：`RaopAudioTransport` 现在对同一个缺口最多问 4 次（间隔 45 ms，最后一次在 135 ms 左右发出，仍落在 `GAP_WAIT_MS` 200 ms 内），限流时**放回队列**而不是直接丢弃（旧代码丢弃过，等于压根没问发送端），且 `RESEND_BACKOFF_MS` 已从 40 ms 降到 12 ms —— 包间隔才 8 ms，一次突发会同时压出好几个缺口，40 ms 的节流等于把第 4 个缺口拖到 160 ms 才问出去，早就错过播放点。如果 `skipped` 仍在涨，看 `recovered : skipped` 的比例和 `tooLate`：比例高且有 `tooLate` → 链路在丢包但重传能救，继续加 `GAP_WAIT_MS`；比例低且 `tooLate` 为 0 → iPhone 在忽略重传请求，只能靠隐藏 |
 | 息屏后停住 | 先看日志 `Locks: wifi=true multicast=true`（Wi-Fi 锁已持有，链路不会被挂起）；都正常还停，就是车机的省电策略把服务掐了，按上面的「不受限制」设置放开 |
 | 状态卡一直显示「等待网络…」 | 车机还没拿到 IPv4。去车机 Wi-Fi 设置确认已连上 iPhone 热点。**不用重开 App** —— 连上后服务会自己开始广播 |
-| 「反向控制」一直是"等待 iPhone 提供"，点按钮没反应 | 说明 `_dacp._tcp` 没解析出来。先看日志有没有 `Remote control offered: DACP-ID=... Active-Remote=...`（有 = iPhone 确实把凭据给了）；再看有没有 `DACP: "iTunes_Ctrl_..." at ...:port`（有 = 端口解析成功）。只有前者没有后者 → mDNS 应答被拦，或这台 iPhone 没广播这个服务 |
+| **AirPlay 2 下按上一首 / 播放暂停 / 下一首没反应** | 不是 bug，是协议限制：状态卡「反向控制」会写**不可用 · AirPlay 2 下苹果已取消这条通道**，日志里是 `Remote control "nextitem" has no path under AirPlay 2`。把「使用 AirPlay 2」关掉、退回 AirPlay 1 即可恢复（点任意一个键也会弹出这个说明和一键切换）。 |
+| 「反向控制」一直是"等待 iPhone 提供"，点按钮没反应 | 说明 `_dacp._tcp` 没解析出来。先确认没在 AP2 会话里（状态卡「当前协议」）；再看日志有没有 `Remote control offered: DACP-ID=... Active-Remote=...`（有 = iPhone 确实把凭据给了）；再看有没有 `DACP: "iTunes_Ctrl_..." at ...:port`（有 = 端口解析成功）。只有前者没有后者 → mDNS 应答被拦，或这台 iPhone 没广播这个服务 |
 
 日志里这些行是**正常**的：
 
@@ -404,13 +448,15 @@ DACP: "iTunes_Ctrl_CFAE09D9DA7527E9" at 172.20.10.1:53111 (matched by DACP id)
 
 ## 已知限制
 
+- **AirPlay 2 没有反向控制**，这是最需要知道的一条：AP2 下方向盘与界面的上一首 / 播放暂停 / 下一首都不会生效，
+  因为 iPhone 不再下发 DACP 凭据，而遥控改走的 MRP 通道至今没有公开实现。想保住这三个键就只能用 AirPlay 1
+  （界面开关切换，或按任意键时弹出的「切回 AirPlay 1」）。两条路互斥，没有折中方案。
 - 只支持 **ALAC** 和 **PCM**（按 `cn=0,1` 协商）。如果发送端坚持 AAC，本端会解不出来 —— 日志里会明说。
 - 单客户端：同一时刻只有一个 iPhone 能连，新连接会顶掉旧连接（这是 AirTunes 语义）。
 - 音频延迟按 RAOP 默认节奏走，没有做额外的时钟同步补偿。听感延迟**等于**流水线手里握着多少音频（`AudioPipeline.TARGET_CUSHION_MS`，当前 250 ms）—— 余量就是延迟，**1:1，只能同增同减**：想更抗卡就得更慢，想更快就更脆。
 - ALAC 解码器与 iOS 实际码流的对照验证是在代码级完成的，**还没有在真机真流上长时间跑过**。
-- **DACP 反向控制也没有真机验证过**。请求格式、端口发现、命令集都是照 shairport-sync 的
-  `dacp.c` 写的，但"iPhone 在这场 classic 会话里到底会不会广播 `_dacp._tcp`"只能上车实测。
-  如果日志里从没出现过 `Remote control offered: DACP-ID=`，说明这个 iPhone / iOS 版本不发这两个头，
-  那 DACP 这条路在纯 AirPlay 下就是走不通的。
+- DACP 的请求格式、端口发现、命令集都是照 shairport-sync 的 `dacp.c` 写的；AP1 会话里
+  `Remote control offered: DACP-ID=` 与 `DACP: "iTunes_Ctrl_..."` 两行日志是判断「这台 iPhone 给不给凭据」的唯一依据。
 - 方向盘 next/prev 在 App 退到后台时收不到（车机把键交给前台窗口）。要解决得加无障碍服务，
   本版未做。
+- AP2 不参与 PTP 时钟对齐、不做多房间同步，也不支持 HomeKit / Siri —— 它就是一个单机的音频出口。

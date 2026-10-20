@@ -24,6 +24,7 @@ import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
@@ -352,18 +353,22 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         setRow(R.string.ui_volume, describeVolume(state))
         setRow(
             R.string.ui_remote_control,
-            if (state.remoteControl) {
-                getString(R.string.ui_remote_control_ready)
-            } else {
-                getString(R.string.ui_remote_control_pending)
+            when {
+                state.remoteControl -> getString(R.string.ui_remote_control_ready)
+                // AirPlay 2 has no reverse channel at all, so "waiting" would be a promise that
+                // never comes true: iOS stops sending DACP-ID / Active-Remote the moment it
+                // upgrades a session to AP2, and nothing else can authorise a command.
+                state.protocol == SinkProtocol.AP2 -> getString(R.string.ui_remote_control_ap2)
+                else -> getString(R.string.ui_remote_control_pending)
             },
         )
 
-        // The buttons only work once the iPhone has published its DACP endpoint.
-        val remoteReady = state.running && state.remoteControl
-        previousButton.isEnabled = remoteReady
-        playPauseButton.isEnabled = remoteReady
-        nextButton.isEnabled = remoteReady
+        // Left enabled while the receiver runs so a press can explain itself — a greyed button in
+        // an AirPlay 2 session looks like a bug, which is exactly how it was reported.
+        val running = state.running
+        previousButton.isEnabled = running
+        playPauseButton.isEnabled = running
+        nextButton.isEnabled = running
 
         // The service reports the cushion it actually started with, so the label can say when the
         // slider has moved somewhere the running receiver has not caught up with yet.
@@ -480,13 +485,49 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
 
     // ------------------------------------------------------------------ remote control
 
-    /** These buttons drive the iPhone over DACP — the same channel the steering wheel uses. */
+    /**
+     * These buttons drive the iPhone over DACP — the same channel the steering wheel uses.
+     *
+     * DACP only exists on classic AirPlay. Under AirPlay 2 the press cannot be delivered, so
+     * instead of a silent no-op the user gets the reason and a one-tap way back to the protocol
+     * that does have it.
+     */
     private fun sendRemoteCommand(command: DacpClient.Command, labelRes: Int) {
-        if (SinkService.remoteCommand(command)) {
-            toast(getString(R.string.ui_control_sent, getString(labelRes)))
-        } else {
-            toast(getString(R.string.ui_control_unavailable))
+        val state = SinkModel.state
+        // Checked before availability: a stale DACP endpoint from an earlier AirPlay 1 session can
+        // still look "ready", and reporting "已发送" for a command AP2 will drop is worse than
+        // saying why it cannot be sent.
+        if (state.protocol == SinkProtocol.AP2) {
+            offerAirPlayOne()
+            return
         }
+        if (state.remoteControl && SinkService.remoteCommand(command)) {
+            toast(getString(R.string.ui_control_sent, getString(labelRes)))
+            return
+        }
+        toast(getString(R.string.ui_control_unavailable))
+    }
+
+    /**
+     * Explains the AirPlay 2 trade-off and offers the switch, because there is no way to have both:
+     * the sender is the only thing that can authorise a remote command, and under AP2 it does not.
+     */
+    private fun offerAirPlayOne() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.ui_control_ap2_title)
+            .setMessage(R.string.ui_control_ap2_message)
+            .setPositiveButton(R.string.ui_control_ap2_switch) { _, _ -> switchToAirPlayOne() }
+            .setNegativeButton(R.string.ui_control_ap2_keep, null)
+            .show()
+    }
+
+    private fun switchToAirPlayOne() {
+        preferences.airPlay2 = false
+        suppressSwitchCallback = true
+        protocolSwitch.isChecked = false
+        suppressSwitchCallback = false
+        SinkLog.i("Remote control needs AirPlay 1; switching the protocol off on request")
+        applyProtocol(R.string.ui_control_ap2_switched)
     }
 
     // ------------------------------------------------------------------ buffer depth
@@ -533,12 +574,12 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
      * cushion. Turning AirPlay 2 off also makes the restart send a goodbye for the old record; that
      * is what stops the phone from pairing against a receiver that no longer answers.
      */
-    private fun applyProtocol() {
+    private fun applyProtocol(messageRes: Int = R.string.ui_airplay2_applied) {
         if (!SinkService.isActive) {
             setRow(R.string.ui_protocol, describeProtocol(SinkModel.state))
             return
         }
-        toast(getString(R.string.ui_airplay2_applied))
+        toast(getString(messageRes))
         SinkService.stop(this)
         rootScroll.postDelayed({ SinkService.start(this) }, RESTART_DELAY_MS)
     }

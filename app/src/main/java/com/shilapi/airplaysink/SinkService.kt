@@ -466,6 +466,17 @@ class SinkService : Service(), RaopEvents {
 
     /** Relays a command coming from the UI buttons or a media key. */
     private fun relayRemoteCommand(command: DacpClient.Command) {
+        // Worth naming explicitly: this is a protocol gap, not a missing endpoint. iOS withholds
+        // DACP-ID and Active-Remote on every AirPlay 2 request, and without the token no receiver
+        // is allowed to drive it — shairport-sync reports the same ("No Remote Control" under AP2).
+        if (SinkModel.state.protocol == SinkProtocol.AP2) {
+            SinkLog.w(
+                "Remote control \"${command.path}\" has no path under AirPlay 2: iOS stops sending " +
+                    "DACP credentials once a session upgrades to AP2; turn the AirPlay 2 switch off " +
+                    "to get the keys back",
+            )
+            return
+        }
         val client = dacp
         if (client == null || !client.isAvailable) {
             SinkLog.w(
