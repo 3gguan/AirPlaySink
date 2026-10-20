@@ -35,6 +35,13 @@ import kotlin.concurrent.thread
  *
  * Both are encrypted the same way: the shared secret from pairing, keyed through the SETUP's `shk`,
  * with the 8-byte nonce sent in the packet padded out to the 12 bytes ChaCha20-Poly1305-IETF wants.
+ *
+ * The event connection can also carry remote commands back to the sender (see [sendCommand]), and
+ * that direction works: a transient-paired, audio-only session is allowed to drive the phone, with
+ * no MFi identity, HomeKit pairing or HID device anywhere. The one thing that has to be exactly
+ * right is the key direction — [ChannelKeys.EVENTS], not the mirror of the control channel. With the
+ * wrong pair, iOS fails the Poly1305 check on the first frame out and closes the event connection
+ * *and* the control connection within tens of milliseconds, which reads like a refusal but is not.
  */
 class Ap2Streams(
     private val localAddress: InetAddress,
@@ -43,7 +50,37 @@ class Ap2Streams(
     private val onFormat: (Format) -> Unit,
     /** One decrypted audio frame: RTP sequence, RTP timestamp and the codec payload. */
     private val onAudio: (sequence: Long, timestamp: Long, payload: ByteArray) -> Unit,
+    /**
+     * Fires when the sender's event connection comes up and when it goes away.
+     *
+     * Remote commands travel on that connection, so the UI has to be able to tell "no session" apart
+     * from "session, but the phone never opened the channel commands use".
+     */
+    private val onEventChannel: (open: Boolean) -> Unit = {},
+    /**
+     * Fires with the status line of the phone's reply to a command we sent.
+     *
+     * This is the only positive confirmation the protocol offers: `RTSP/1.0 200` on the event
+     * connection means the command was taken. Anything else — or a reply that never comes because
+     * the connection died — has to be visible on a head unit where the toast is swallowed.
+     */
+    private val onCommandReply: (status: String) -> Unit = {},
 ) : Closeable {
+
+    /** Where a `POST /command` ended up. Every value is reported, so none of them is a guess. */
+    enum class Delivery {
+        /** Written into the encrypted channel. Whether the phone acted on it is a separate matter. */
+        SENT,
+
+        /** The phone never opened the event connection, or it has already gone away. */
+        NO_EVENT_CHANNEL,
+
+        /** The write itself failed — the socket is broken, not merely idle. */
+        WRITE_FAILED,
+
+        /** No AirPlay 2 stream has been set up on this session yet. */
+        NO_STREAM,
+    }
 
     companion object {
         const val STREAM_TYPE_REALTIME = 96L
@@ -87,9 +124,33 @@ class Ap2Streams(
 
     private var audioKey: ByteArray? = null
 
+    /**
+     * The sender's event connection, kept so commands can travel back over it.
+     *
+     * AirPlay 2 has no separate "command" socket: the phone opens this one for playback events and
+     * accepts `POST /command` on it, which is how shairport-sync sends `sendMediaRemoteCommand`.
+     */
+    @Volatile
+    private var eventLink: Ap2SecureLink? = null
+
+    /** One command at a time: [Ap2SecureLink.output] frames are stateful, so writes must not meet. */
+    private val eventWriteLock = Any()
+
+    /** Commands written on this channel, for the log only — no `CSeq` goes on the wire. */
+    private var commandsSent = 0L
+
     /** Samples per packet, used to turn the realtime timestamp into an ordering counter. */
     @Volatile
     private var audioFramesPerPacket = 352
+
+    /**
+     * The sender's `groupUUID`, taken from the initial SETUP.
+     *
+     * Every `sendMediaRemoteCommand` has to name the group it is addressed to, and this is the only
+     * place the phone tells us which group that is. Null until the initial SETUP arrives.
+     */
+    @Volatile
+    private var groupId: String? = null
 
     /** Set once the buffered stream exists, so a second SETUP does not open a second port pair. */
     private var streamDescriptor: Map<String, Any?>? = null
@@ -111,6 +172,12 @@ class Ap2Streams(
             SinkLog.i(
                 "AP2: SETUP (initial) timingProtocol=${protocol ?: "-"} keys=${plist.keys}",
             )
+            // The group every remote command has to be addressed to. Phones send it here; a
+            // receiver that never reads it cannot build a valid sendMediaRemoteCommand.
+            (plist["groupUUID"] as? String)?.let { gid ->
+                groupId = gid
+                SinkLog.i("AP2: group UUID $gid — remote commands can name it")
+            } ?: SinkLog.w("AP2: no groupUUID in the initial SETUP")
             val eventPort = openEventChannel()
             val response = linkedMapOf<String, Any?>(
                 "eventPort" to eventPort.toLong(),
@@ -177,15 +244,29 @@ class Ap2Streams(
             client.getInputStream(),
             client.getOutputStream(),
             sharedSecret,
-            salt = "Events-Salt",
-            readKeyInfo = "Events-Read-Encryption-Key",
-            writeKeyInfo = "Events-Write-Encryption-Key",
-            label = "events",
+            ChannelKeys.EVENTS,
         )
         val reader = RtspReader(link.input)
+        eventLink = link
+        onEventChannel(true)
         try {
             while (!closed.get()) {
                 val request = reader.readRequest() ?: break
+
+                // The phone answers our own commands on this same socket. A reply is not a request
+                // and must not be replied to, or the two sides bounce responses at each other. Its
+                // status is the only evidence a command was accepted: 200 means taken, silence
+                // followed by a closed socket means refused.
+                if (request.method.startsWith("RTSP/")) {
+                    val status = "${request.method} ${request.uri}".trim()
+                    SinkLog.i(
+                        "AP2: events <- command reply $status " +
+                            "cseq=${request.cseq} body=${request.content.size}B",
+                    )
+                    onCommandReply(status)
+                    continue
+                }
+
                 SinkLog.i(
                     "AP2: events <- ${request.method} ${request.uri} " +
                         "(${request.content.size}B ${request.contentType})",
@@ -198,8 +279,71 @@ class Ap2Streams(
         } catch (error: Exception) {
             if (!closed.get()) SinkLog.w("AP2: event channel ended: ${error.message}")
         } finally {
+            // A phone that reconnects opens a second connection before the first one's close is
+            // noticed. Only the current link may report, or the UI would flip to "no channel"
+            // while a perfectly good one is open.
+            if (eventLink === link) {
+                eventLink = null
+                onEventChannel(false)
+            }
             runCatching { client.close() }
             SinkLog.i("AP2: event channel closed")
+        }
+    }
+
+    // ------------------------------------------------------------------ remote control
+
+    /**
+     * Sends one transport command as an AirPlay 2 `sendMediaRemoteCommand`.
+     *
+     * [fallbackGroupId] is only used when the phone's SETUP carried no `groupUUID`. Trying anyway is
+     * the point: the reply — 200, or silence and a closed socket — is the measurement.
+     */
+    fun sendRemoteCommand(number: Int, fallbackGroupId: String): Delivery {
+        val gid = groupId ?: fallbackGroupId.also {
+            SinkLog.w("AP2: no group UUID from the sender; addressing remote commands to $it")
+        }
+        return sendCommand(Ap2Remote.command(number, gid))
+    }
+
+    /**
+     * One `POST /command` on the event connection.
+     *
+     * No `updateInfo` is sent first, and that is a measurement rather than an omission: the reply to
+     * the command itself is the confirmation this receiver relies on, and on 2026-10-20 the phone
+     * answered `RTSP/1.0 200` to every bare command without one. shairport-sync does open the
+     * channel with `updateInfo`; this receiver never sends it, so nothing has been measured about
+     * how iOS reacts to it *with the right keys* — the earlier "it closes the connection" result came
+     * from running it with the mirrored key pair, and says nothing about the message.
+     */
+    fun sendCommand(command: Map<String, Any?>): Delivery = synchronized(eventWriteLock) {
+        val link = eventLink
+        if (link == null) {
+            SinkLog.w("AP2: command ${command["type"]} dropped — the event channel is not open")
+            return@synchronized Delivery.NO_EVENT_CHANNEL
+        }
+        commandsSent++
+        val body = BPlist.write(command)
+        // No CSeq here, deliberately: shairport-sync's ap2_event_port_post_command sends only
+        // Content-Length and Content-Type. The event port is not the RTSP control channel and the
+        // phone parses this as an RTSP-flavoured envelope, so an extra header is a real difference
+        // and not a harmless one.
+        val head = "POST /command RTSP/1.0\r\n" +
+            "Content-Length: ${body.size}\r\n" +
+            "Content-Type: application/x-apple-binary-plist\r\n\r\n"
+        SinkLog.i(
+            "AP2: command -> ${command["type"]} #$commandsSent body=${body.size}B " +
+                command.filterKeys { it != "params" && it != "value" },
+        )
+        try {
+            // One write so the header and the plist land together; a half-written command is a
+            // command the phone cannot parse. [Ap2SecureLink.output] serialises writes itself.
+            val bytes = head.toByteArray(Charsets.ISO_8859_1) + body
+            link.output.write(bytes)
+            Delivery.SENT
+        } catch (error: Exception) {
+            SinkLog.w("AP2: command ${command["type"]} failed: ${error.message}")
+            Delivery.WRITE_FAILED
         }
     }
 
@@ -241,6 +385,12 @@ class Ap2Streams(
         }
 
         audioKey = key
+
+        // Per-stream counters: a resume after a pause is a new stream, and the "first frame" lines
+        // only print while these are zero. Without the reset the second stream would look silent.
+        audioFrames = 0
+        realtimePackets = 0
+        decryptFailures = 0
 
         // Both stream types keep an RTCP control port next to the audio port. Nothing acts on what
         // arrives there — playback is driven by the audio itself — but the port has to exist and be
@@ -493,6 +643,26 @@ class Ap2Streams(
     }
 
     fun describe(): String = "audio stream, $audioFrames decoded frames"
+
+    /**
+     * Closes the audio ports and forgets the stream, without touching the event channel.
+     *
+     * The phone ends the stream on every pause and opens a new one when playback resumes, but it
+     * keeps the session — and the event connection that carries remote commands — alive across
+     * both. Forgetting `streamDescriptor` here is what lets the next `SETUP` hand out new ports
+     * instead of pointing the sender back at sockets that are already closed.
+     */
+    fun stopAudioStream() {
+        runCatching { audioServer?.close() }
+        runCatching { realtimeSocket?.close() }
+        runCatching { controlSocket?.close() }
+        audioServer = null
+        realtimeSocket = null
+        controlSocket = null
+        streamDescriptor = null
+        audioKey = null
+        SinkLog.i("AP2: audio ports closed after $audioFrames frames; the event channel stays")
+    }
 
     override fun close() {
         closed.set(true)

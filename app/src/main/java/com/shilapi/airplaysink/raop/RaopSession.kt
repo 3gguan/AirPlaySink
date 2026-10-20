@@ -1,6 +1,7 @@
 package com.shilapi.airplaysink.raop
 
 import com.shilapi.airplaysink.SinkProtocol
+import com.shilapi.airplaysink.ap2.Ap2Remote
 import com.shilapi.airplaysink.ap2.Ap2SecureLink
 import com.shilapi.airplaysink.ap2.Ap2Session
 import com.shilapi.airplaysink.ap2.Ap2Streams
@@ -10,6 +11,7 @@ import com.shilapi.airplaysink.audio.DmapReader
 import com.shilapi.airplaysink.audio.RaopAudioTransport
 import com.shilapi.airplaysink.crypto.AppleChallenge
 import com.shilapi.airplaysink.crypto.RaopCrypto
+import com.shilapi.airplaysink.dacp.DacpClient
 import com.shilapi.airplaysink.rtsp.AnnounceInfo
 import com.shilapi.airplaysink.rtsp.RaopCodec
 import com.shilapi.airplaysink.rtsp.RtspReader
@@ -53,6 +55,24 @@ interface RaopEvents {
      * not carry it"; the receiver keeps whatever it learned before.
      */
     fun onDacpCredentials(dacpId: String?, activeRemote: String?, peerAddress: InetAddress)
+
+    /**
+     * The sender opened or closed the AirPlay 2 event connection.
+     *
+     * Separate from [onClientConnected]: the phone can hold a working audio session without ever
+     * opening this one, and in that case a remote command has nowhere to go. Without this the UI
+     * could only show "AirPlay 2" and leave the user guessing why the buttons do nothing.
+     */
+    fun onEventChannelChanged(open: Boolean)
+
+    /**
+     * The phone's status line for a remote command sent over the AirPlay 2 event connection.
+     *
+     * `RTSP/1.0 200` is the protocol's way of saying the command was taken; the button press itself
+     * only proves the bytes left this device. Both facts are reported because on a head unit they
+     * are the difference between "the phone accepted it" and "the phone closed the session".
+     */
+    fun onAp2CommandReply(status: String)
 
     /**
      * The mDNS advertisement changed state.
@@ -417,6 +437,21 @@ class RaopSession(
                 SinkLog.i("AP2: FLUSH — dropped buffered audio")
                 respond(request, RtspResponse(200))
             }
+            // Two different requests wear this name. With a `streams` array it ends the *audio
+            // stream* and nothing else, which is what the phone sends when playback pauses; without
+            // one it ends the session. Treating the first as the second is what made pause-then-play
+            // impossible: the receiver dropped the control connection, so the play command that
+            // followed had no channel left to travel on.
+            "TEARDOWN" -> {
+                if (endsOnlyTheStream(request)) {
+                    stopAirPlayStream()
+                    respond(request, RtspResponse(200))
+                } else {
+                    respond(request, RtspResponse(200).addHeader("Connection", "close"))
+                    SinkLog.i("AP2: TEARDOWN — the session ends here")
+                    closed = true
+                }
+            }
             // Playback timing. This receiver plays from its own clock and does not align with other
             // AirPlay 2 devices, so the anchor is acknowledged rather than applied.
             "SETRATEANCHORI", "SETRATEANCHOR", "SETPEERS", "SETPEER", "REMOVEPEER" -> {
@@ -438,6 +473,45 @@ class RaopSession(
         BPlistReader.parse(bytes)
     } catch (_: Exception) {
         null
+    }
+
+    /**
+     * Whether an AirPlay 2 `TEARDOWN` is aimed at the audio stream or at the whole session.
+     *
+     * shairport-sync reads it the same way: a `streams` array means "stop the player, keep the
+     * connection open", an empty or streams-less plist means "terminate the connection". The
+     * distinction is not cosmetic. The phone sends the stream form every time playback stops, so a
+     * receiver that closes the connection on it is unreachable for the rest of the pause — and the
+     * play command that follows has nowhere to go, which is exactly how "pause works, play does
+     * nothing" happens.
+     */
+    private fun endsOnlyTheStream(request: RtspRequest): Boolean {
+        if (request.content.isEmpty()) return false
+        val plist = safePlist(request.content) as? Map<*, *>
+        if (plist == null) {
+            SinkLog.w("AP2: TEARDOWN body is not a readable bplist; treating it as the session end")
+            return false
+        }
+        SinkLog.i("AP2: TEARDOWN plist: ${BPlistReader.describe(plist)}")
+        return teardownEndsOnlyTheStream(plist)
+    }
+
+    /**
+     * Drops the audio side of an AirPlay 2 session and leaves the session itself standing.
+     *
+     * Everything a remote command needs — the control connection, the pairing secret and the event
+     * channel — belongs to the session, not to the stream, so the buttons keep working while the
+     * phone is paused. On resume the phone sends another `SETUP`, which opens fresh audio ports
+     * because [Ap2Streams.stopAudioStream] forgets the old descriptor.
+     */
+    private fun stopAirPlayStream() {
+        val wasStreaming = streaming
+        streaming = false
+        pipeline?.let { runCatching { it.close() } }
+        pipeline = null
+        ap2Streams?.stopAudioStream()
+        if (wasStreaming) events.onStreamingStopped()
+        SinkLog.i("AP2: audio stream stopped; the session and its event channel stay up")
     }
 
     /**
@@ -560,7 +634,47 @@ class RaopSession(
                     audioPipeline.submit(sequence, timestamp, payload)
                 }
             },
+            onEventChannel = { open ->
+                SinkLog.i(
+                    if (open) {
+                        "AP2: event channel up — remote commands have somewhere to go"
+                    } else {
+                        "AP2: event channel down — remote commands cannot be sent until it returns"
+                    },
+                )
+                events.onEventChannelChanged(open)
+            },
+            onCommandReply = { status -> events.onAp2CommandReply(status) },
+            // Deliberately not sending updateInfo here: the phone answers the bare command with
+            // RTSP/1.0 200, so nothing in this receiver waits for it. shairport-sync does send it,
+            // but the earlier attempt here ran with the mirrored event key pair, so its failure
+            // measured the keys, not the message.
         )
+    }
+
+    /**
+     * Sends a transport command to the sender over AirPlay 2's own remote control channel.
+     *
+     * The group UUID is normally taken from the initial SETUP; the fallback is the pairing id so a
+     * command still has a well-formed destination when the sender sent no `groupUUID`.
+     */
+    fun sendAp2Remote(command: DacpClient.Command): Ap2Streams.Delivery {
+        val number = Ap2Remote.number(command)
+        if (number == null) {
+            SinkLog.w("AP2: ${command.path} has no media remote command number")
+            return Ap2Streams.Delivery.NO_STREAM
+        }
+        val streams = ap2Streams
+        if (streams == null) {
+            SinkLog.w("AP2: remote command ${command.path} needs a stream; none is set up yet")
+            return Ap2Streams.Delivery.NO_STREAM
+        }
+        val delivery = streams.sendRemoteCommand(
+            number,
+            Ap2Session.pairingId(config.deviceId),
+        )
+        SinkLog.i("AP2: remote command ${command.path} (#$number) result=$delivery")
+        return delivery
     }
 
     private fun optionsResponse(): RtspResponse = RtspResponse(200)
@@ -914,6 +1028,18 @@ class RaopSession(
         sessionKey = null
     }
 }
+
+/**
+ * Whether an AirPlay 2 `TEARDOWN` body is aimed at the audio stream rather than the session.
+ *
+ * The rule is shairport-sync's (`handle_teardown_2`): a dictionary carrying a `streams` array stops
+ * the player and leaves the connection alone; anything else — an empty body, an unreadable plist,
+ * or a plist without that key — ends the connection. Kept as a free function so a unit test can
+ * pin it without a socket: getting it backwards is silent, and it breaks resume rather than
+ * anything that shows up in a build.
+ */
+internal fun teardownEndsOnlyTheStream(plist: Any?): Boolean =
+    (plist as? Map<*, *>)?.get("streams") is List<*>
 
 private fun String.intValueAfter(marker: String): Int? {
     val index = indexOf(marker)

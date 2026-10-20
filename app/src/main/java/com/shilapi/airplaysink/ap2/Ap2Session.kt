@@ -173,8 +173,24 @@ class Ap2Session(
             SinkLog.i("AP2:   /info request: ${request.content.hex(160)}")
         }
 
+        val body = BPlist.write(infoPlist())
+        SinkLog.i("AP2: /info answered with ${body.size}B bplist")
+        return RtspResponse(200)
+            .addHeader("Content-Type", "application/x-apple-binary-plist")
+            .also { it.content = body }
+    }
+
+    /**
+     * The device description, shared by two callers: the `/info` reply and the `updateInfo` message
+     * the event channel opens with.
+     *
+     * They carry the same dictionary — shairport-sync builds the event-channel one from the same
+     * `generateInfoPlist` and only drops the reply-only extras — so keeping one builder is what
+     * makes the two impossible to drift apart.
+     */
+    fun infoPlist(): Map<String, Any?> {
         val deviceId = deviceIdWithColons(config.deviceId)
-        val info = linkedMapOf<String, Any?>(
+        return linkedMapOf<String, Any?>(
             "deviceID" to deviceId,
             "features" to FEATURES,
             "featuresEx" to Ap2Txt.featuresEx(FEATURES),
@@ -212,11 +228,6 @@ class Ap2Session(
             // leaves the sender with two disagreeing descriptions of the same device.
             "txtAirPlay" to Ap2Txt.encode(txtProperties),
         )
-        val body = BPlist.write(info)
-        SinkLog.i("AP2: /info answered with ${body.size}B bplist")
-        return RtspResponse(200)
-            .addHeader("Content-Type", "application/x-apple-binary-plist")
-            .also { it.content = body }
     }
 
     // ------------------------------------------------------------------ /fp-setup

@@ -28,6 +28,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
+import com.shilapi.airplaysink.ap2.Ap2Streams
 import com.shilapi.airplaysink.dacp.DacpClient
 import com.shilapi.airplaysink.util.SinkLog
 import java.util.Locale
@@ -48,6 +49,7 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     private lateinit var rootScroll: ScrollView
     private lateinit var serviceSwitch: SwitchCompat
     private lateinit var protocolSwitch: SwitchCompat
+    private lateinit var ap2RemoteSwitch: SwitchCompat
     private lateinit var bootSwitch: SwitchCompat
     private lateinit var batteryState: TextView
     private lateinit var batteryApplyButton: Button
@@ -100,6 +102,7 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         rootScroll = findViewById(R.id.rootScroll)
         serviceSwitch = findViewById(R.id.serviceSwitch)
         protocolSwitch = findViewById(R.id.protocolSwitch)
+        ap2RemoteSwitch = findViewById(R.id.ap2RemoteSwitch)
         bootSwitch = findViewById(R.id.bootSwitch)
         deviceNameInput = findViewById(R.id.deviceNameInput)
         bufferSeek = findViewById(R.id.bufferSeek)
@@ -151,6 +154,16 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
             if (checked == preferences.airPlay2) return@setOnCheckedChangeListener
             preferences.airPlay2 = checked
             applyProtocol()
+        }
+
+        // Changing this only changes what the receiver does with a press, so it still needs a
+        // restart — the switch is read once when the receiver starts.
+        ap2RemoteSwitch.isChecked = preferences.ap2Remote
+        ap2RemoteSwitch.setOnCheckedChangeListener { _, checked ->
+            if (suppressSwitchCallback) return@setOnCheckedChangeListener
+            if (checked == preferences.ap2Remote) return@setOnCheckedChangeListener
+            preferences.ap2Remote = checked
+            applyProtocol(R.string.ui_ap2_remote_applied)
         }
 
         batteryState = findViewById(R.id.batteryState)
@@ -279,6 +292,9 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
             R.string.ui_now_playing,
             R.string.ui_volume,
             R.string.ui_remote_control,
+            // Only meaningful for the experiment, but always present: a row that appears and
+            // disappears would move everything below it while the user is reading.
+            R.string.ui_ap2_remote,
         )) {
             rows[label] = addRow(label)
         }
@@ -328,6 +344,7 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         suppressSwitchCallback = true
         serviceSwitch.isChecked = state.running || state.starting || state.waitingForNetwork
         serviceSwitch.isEnabled = !state.starting
+        ap2RemoteSwitch.isChecked = preferences.ap2Remote
         suppressSwitchCallback = false
 
         setRow(
@@ -355,13 +372,15 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
             R.string.ui_remote_control,
             when {
                 state.remoteControl -> getString(R.string.ui_remote_control_ready)
-                // AirPlay 2 has no reverse channel at all, so "waiting" would be a promise that
-                // never comes true: iOS stops sending DACP-ID / Active-Remote the moment it
-                // upgrades a session to AP2, and nothing else can authorise a command.
+                // Under AirPlay 2 the DACP credentials are never sent, but the protocol has its own
+                // channel for the same job — say which of the two is in play instead of "unavailable".
+                state.protocol == SinkProtocol.AP2 && state.ap2RemoteEnabled ->
+                    getString(R.string.ui_remote_control_ap2_channel)
                 state.protocol == SinkProtocol.AP2 -> getString(R.string.ui_remote_control_ap2)
                 else -> getString(R.string.ui_remote_control_pending)
             },
         )
+        setRow(R.string.ui_ap2_remote, describeAp2Remote(state))
 
         // Left enabled while the receiver runs so a press can explain itself — a greyed button in
         // an AirPlay 2 session looks like a bug, which is exactly how it was reported.
@@ -425,6 +444,51 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     private fun clock(seconds: Int): String =
         String.format(Locale.US, "%d:%02d", seconds / 60, seconds % 60)
 
+    /**
+     * The AirPlay 2 remote control experiment's own status line.
+     *
+     * Three separate facts, and the row names whichever one is missing: whether the switch is on,
+     * whether the phone opened the channel, and how the last press ended. "The button does nothing"
+     * has three different causes here and only one of them is the phone refusing the command.
+     */
+    private fun describeAp2Remote(state: SinkModel.State): String {
+        if (!state.ap2RemoteEnabled) return getString(R.string.ui_ap2_remote_off)
+        val result = state.remoteCommandResult?.let {
+            // A "sent" from a channel that has since gone away is history, not status: the next
+            // press cannot go anywhere, and the row has to say that rather than keep the old luck.
+            if (it == Ap2Streams.Delivery.SENT && !state.eventChannelOpen) {
+                Ap2Streams.Delivery.NO_EVENT_CHANNEL
+            } else {
+                it
+            }
+        }
+        if (result != null) {
+            if (result == Ap2Streams.Delivery.SENT && state.ap2CommandReply != null) {
+                // The phone answered. This is the only confirmation the protocol offers, and on a
+                // head unit it is the difference between "the button worked" and "the row is stale".
+                return getString(
+                    R.string.ui_ap2_remote_accepted,
+                    state.ap2CommandReply.removePrefix("RTSP/1.0 "),
+                )
+            }
+            return getString(
+                when (result) {
+                    Ap2Streams.Delivery.SENT -> R.string.ui_ap2_remote_sent
+                    Ap2Streams.Delivery.NO_EVENT_CHANNEL -> R.string.ui_ap2_remote_no_channel
+                    Ap2Streams.Delivery.WRITE_FAILED -> R.string.ui_ap2_remote_write_failed
+                    Ap2Streams.Delivery.NO_STREAM -> R.string.ui_ap2_remote_no_stream
+                },
+            )
+        }
+        return getString(
+            if (state.eventChannelOpen) {
+                R.string.ui_ap2_remote_ready
+            } else {
+                R.string.ui_ap2_remote_waiting
+            },
+        )
+    }
+
     // ------------------------------------------------------------------ log view
 
     private fun scheduleLogRefresh() {
@@ -486,39 +550,81 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     // ------------------------------------------------------------------ remote control
 
     /**
-     * These buttons drive the iPhone over DACP — the same channel the steering wheel uses.
+     * These buttons drive the iPhone: DACP on AirPlay 1, `sendMediaRemoteCommand` on AirPlay 2.
      *
-     * DACP only exists on classic AirPlay. Under AirPlay 2 the press cannot be delivered, so
-     * instead of a silent no-op the user gets the reason and a one-tap way back to the protocol
-     * that does have it.
+     * Every press leaves a trace, both in the log and on the status card. A click that does nothing
+     * at all is the one outcome this must never have — the head unit's toasts are easy to miss, and
+     * without the trace there is nothing to tell "not sent" apart from "sent and ignored".
      */
     private fun sendRemoteCommand(command: DacpClient.Command, labelRes: Int) {
         val state = SinkModel.state
-        // Checked before availability: a stale DACP endpoint from an earlier AirPlay 1 session can
-        // still look "ready", and reporting "已发送" for a command AP2 will drop is worse than
-        // saying why it cannot be sent.
+        val label = getString(labelRes)
+        SinkLog.i(
+            "UI: \"$label\" pressed (running=${state.running}, protocol=${state.protocol}, " +
+                "ap2Remote=${state.ap2RemoteEnabled}, eventChannel=${state.eventChannelOpen})",
+        )
         if (state.protocol == SinkProtocol.AP2) {
-            offerAirPlayOne()
+            // The switch can be on while the running receiver still predates that change — it only
+            // takes effect on restart. Saying so beats sending into the void.
+            if (preferences.ap2Remote && !state.ap2RemoteEnabled) {
+                toast(getString(R.string.ui_ap2_remote_needs_restart))
+                return
+            }
+            if (state.ap2RemoteEnabled) {
+                // Immediate feedback, then the outcome replaces it: the send goes off the main
+                // thread, and a silent half-second looks exactly like a dead button.
+                setRow(R.string.ui_ap2_remote, getString(R.string.ui_ap2_remote_sending, label))
+                SinkService.ap2Remote(command) { delivery -> reportAp2Remote(delivery, label) }
+                return
+            }
+            offerAp2Remote()
             return
         }
         if (state.remoteControl && SinkService.remoteCommand(command)) {
-            toast(getString(R.string.ui_control_sent, getString(labelRes)))
+            toast(getString(R.string.ui_control_sent, label))
             return
         }
         toast(getString(R.string.ui_control_unavailable))
     }
 
+    /** Turns one delivery result into the sentence the user sees. */
+    private fun reportAp2Remote(delivery: Ap2Streams.Delivery, label: String) {
+        toast(
+            when (delivery) {
+                Ap2Streams.Delivery.SENT -> getString(R.string.ui_control_ap2_sent, label)
+                Ap2Streams.Delivery.NO_EVENT_CHANNEL ->
+                    getString(R.string.ui_control_ap2_no_channel)
+                Ap2Streams.Delivery.WRITE_FAILED ->
+                    getString(R.string.ui_control_ap2_write_failed)
+                Ap2Streams.Delivery.NO_STREAM -> getString(R.string.ui_control_ap2_no_stream)
+            },
+        )
+    }
+
     /**
-     * Explains the AirPlay 2 trade-off and offers the switch, because there is no way to have both:
-     * the sender is the only thing that can authorise a remote command, and under AP2 it does not.
+     * The AP2 remote control switch is off while the receiver is speaking AirPlay 2.
+     *
+     * This generation has no other channel for a press to travel on, so the dialog offers the switch
+     * first — turning it on is far less disruptive than dropping back to AirPlay 1 — and keeps the
+     * protocol fallback as the third choice.
      */
-    private fun offerAirPlayOne() {
+    private fun offerAp2Remote() {
         AlertDialog.Builder(this)
             .setTitle(R.string.ui_control_ap2_title)
             .setMessage(R.string.ui_control_ap2_message)
-            .setPositiveButton(R.string.ui_control_ap2_switch) { _, _ -> switchToAirPlayOne() }
+            .setPositiveButton(R.string.ui_control_ap2_enable) { _, _ -> enableAp2Remote() }
+            .setNeutralButton(R.string.ui_control_ap2_switch) { _, _ -> switchToAirPlayOne() }
             .setNegativeButton(R.string.ui_control_ap2_keep, null)
             .show()
+    }
+
+    private fun enableAp2Remote() {
+        preferences.ap2Remote = true
+        suppressSwitchCallback = true
+        ap2RemoteSwitch.isChecked = true
+        suppressSwitchCallback = false
+        SinkLog.i("Remote control needs the AP2 remote channel; turning the switch on request")
+        applyProtocol(R.string.ui_ap2_remote_applied)
     }
 
     private fun switchToAirPlayOne() {

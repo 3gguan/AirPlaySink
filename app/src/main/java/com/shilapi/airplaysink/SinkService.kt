@@ -16,9 +16,12 @@ import android.net.Network
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
+import com.shilapi.airplaysink.ap2.Ap2Streams
 import com.shilapi.airplaysink.dacp.DacpClient
 import com.shilapi.airplaysink.net.LocalNetwork
 import com.shilapi.airplaysink.raop.RaopEvents
@@ -62,6 +65,21 @@ class SinkService : Service(), RaopEvents {
             val service = instance ?: return false
             service.relayRemoteCommand(command)
             return true
+        }
+
+        /**
+         * Sends a transport command over AirPlay 2's own channel, asynchronously.
+         *
+         * [onResult] runs on the main thread with exactly what happened, because the write goes to
+         * a socket and the UI has to report the outcome rather than a guess.
+         */
+        fun ap2Remote(command: DacpClient.Command, onResult: (Ap2Streams.Delivery) -> Unit) {
+            val service = instance
+            if (service == null) {
+                onResult(Ap2Streams.Delivery.NO_STREAM)
+                return
+            }
+            service.sendAp2RemoteAsync(command, onResult)
         }
 
         fun start(context: Context) {
@@ -250,6 +268,13 @@ class SinkService : Service(), RaopEvents {
                 address = endpoint.address.hostAddress,
                 adverisedName = config.instanceName,
                 port = sink.boundPort,
+                // Read back from the preference the receiver was started with, so a switch flipped
+                // without the restart landing cannot make the status card promise something the
+                // running receiver does not implement.
+                ap2RemoteEnabled = preferences.ap2Remote,
+                eventChannelOpen = false,
+                remoteCommandResult = null,
+                ap2CommandReply = null,
                 lastError = null,
             )
         }
@@ -410,10 +435,33 @@ class SinkService : Service(), RaopEvents {
                 album = null,
                 progressCurrentSeconds = 0,
                 progressTotalSeconds = 0,
+                // Both belong to the session that just ended, and a stale "ready" is worse than a
+                // blank: it would promise a channel that no longer exists.
+                eventChannelOpen = false,
+                remoteCommandResult = null,
+                ap2CommandReply = null,
             )
         }
         updatePlaybackState()
         updateNotification("Waiting for the iPhone")
+    }
+
+    /**
+     * The event connection remote commands travel on. Worth surfacing because a phone can hold a
+     * perfectly good audio session without ever opening it, and then every command has nowhere to
+     * go — which looks identical to a dead button.
+     */
+    override fun onEventChannelChanged(open: Boolean) {
+        SinkModel.update { it.copy(eventChannelOpen = open) }
+    }
+
+    /**
+     * The phone took our command. Reported separately from the send because the two are different
+     * facts: a `SENT` only means the bytes left this device.
+     */
+    override fun onAp2CommandReply(status: String) {
+        SinkLog.i("AP2: command accepted by the sender — $status")
+        SinkModel.update { it.copy(ap2CommandReply = status) }
     }
 
     override fun onStreamingStarted() {
@@ -464,17 +512,55 @@ class SinkService : Service(), RaopEvents {
 
     // ------------------------------------------------------------------ remote control
 
+    /** Handler for the one callback that has to land on the main thread. */
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    /**
+     * Sends a command off the caller's thread and reports the outcome on the main thread.
+     *
+     * The result is also left in [SinkModel] so the status card keeps showing it after the toast is
+     * gone: on a head unit the toast is easy to miss, and "nothing happened" is the complaint this
+     * path exists to answer.
+     */
+    private fun sendAp2RemoteAsync(
+        command: DacpClient.Command,
+        onResult: (Ap2Streams.Delivery) -> Unit,
+    ) {
+        val sink = receiver
+        SinkLog.i(
+            "Remote control \"${command.path}\": sending over the AP2 channel " +
+                "(receiver=${if (sink == null) "none" else "up"})",
+        )
+        // Cleared here, on the caller's thread, and therefore before the write below: a reply can
+        // only arrive after the write, so this ordering cannot drop one.
+        SinkModel.update { it.copy(ap2CommandReply = null) }
+        Thread({
+            val delivery = try {
+                sink?.sendAp2Remote(command) ?: Ap2Streams.Delivery.NO_STREAM
+            } catch (error: Exception) {
+                SinkLog.w("Remote control \"${command.path}\" failed to send: ${error.message}")
+                Ap2Streams.Delivery.WRITE_FAILED
+            }
+            SinkLog.i("Remote control \"${command.path}\" over AP2: $delivery")
+            SinkModel.update { it.copy(remoteCommandResult = delivery) }
+            mainHandler.post { onResult(delivery) }
+        }, "ap2-remote").start()
+    }
+
     /** Relays a command coming from the UI buttons or a media key. */
     private fun relayRemoteCommand(command: DacpClient.Command) {
-        // Worth naming explicitly: this is a protocol gap, not a missing endpoint. iOS withholds
-        // DACP-ID and Active-Remote on every AirPlay 2 request, and without the token no receiver
-        // is allowed to drive it — shairport-sync reports the same ("No Remote Control" under AP2).
+        // AirPlay 2 has its own channel for this — the one shairport-sync drives from MPRIS/D-Bus.
+        // It carries `sendMediaRemoteCommand` over the encrypted event connection, so the DACP
+        // credentials iOS stops sending under AP2 are not needed at all.
         if (SinkModel.state.protocol == SinkProtocol.AP2) {
-            SinkLog.w(
-                "Remote control \"${command.path}\" has no path under AirPlay 2: iOS stops sending " +
-                    "DACP credentials once a session upgrades to AP2; turn the AirPlay 2 switch off " +
-                    "to get the keys back",
-            )
+            if (preferences.ap2Remote) {
+                sendAp2RemoteAsync(command) { }
+            } else {
+                SinkLog.w(
+                    "Remote control \"${command.path}\" under AirPlay 2 needs the " +
+                        "\"AP2 remote control\" switch; without it there is no channel to use",
+                )
+            }
             return
         }
         val client = dacp

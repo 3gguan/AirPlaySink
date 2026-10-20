@@ -1,6 +1,8 @@
 package com.shilapi.airplaysink.raop
 
 import android.content.Context
+import com.shilapi.airplaysink.ap2.Ap2Streams
+import com.shilapi.airplaysink.dacp.DacpClient
 import com.shilapi.airplaysink.net.Ap2Advertiser
 import com.shilapi.airplaysink.net.MdnsAdvertiser
 import com.shilapi.airplaysink.net.MdnsGoodbye
@@ -181,6 +183,15 @@ class RaopReceiver(
 
     /** True while a sender holds the control connection. */
     val hasClient: Boolean get() = currentSession != null
+
+    /**
+     * Sends a transport command to the sender over AirPlay 2's own remote control channel.
+     *
+     * Only the live session can answer this: the event connection the command travels on belongs to
+     * it, and a new connection replaces the old one.
+     */
+    fun sendAp2Remote(command: DacpClient.Command): Ap2Streams.Delivery =
+        currentSession?.sendAp2Remote(command) ?: Ap2Streams.Delivery.NO_STREAM
 
     /** Keeps the socket alive without touching the session. */
     fun isServing(): Boolean = running && serverSocket?.isClosed == false

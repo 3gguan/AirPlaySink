@@ -56,6 +56,19 @@ class SinkPreferences(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_AIRPLAY2, value).apply()
 
     /**
+     * Whether to drive the sender's transport controls over AirPlay 2's own remote control channel.
+     *
+     * On by default: this is the only way the buttons work under AirPlay 2, and it was verified on
+     * a real iPhone on 2026-10-20 — the phone answers `RTSP/1.0 200` to `sendMediaRemoteCommand` and
+     * keeps the session open. The switch stays because it changes the protocol a running receiver
+     * speaks, and turning it off is the way back to AirPlay 1-era behaviour if a future iOS disagrees.
+     * Read when the receiver starts, so a change needs a restart.
+     */
+    var ap2Remote: Boolean
+        get() = prefs.getBoolean(KEY_AP2_REMOTE, true)
+        set(value) = prefs.edit().putBoolean(KEY_AP2_REMOTE, value).apply()
+
+    /**
      * How much audio to hold in front of the speaker, in milliseconds.
      *
      * The receiver's latency and its tolerance for a stalling link are the same number, so this is
@@ -100,6 +113,7 @@ class SinkPreferences(context: Context) {
         private const val KEY_SERVICE_ENABLED = "service_enabled"
         private const val KEY_START_ON_BOOT = "start_on_boot"
         private const val KEY_AIRPLAY2 = "airplay2"
+        private const val KEY_AP2_REMOTE = "ap2_remote"
         private const val KEY_BUFFER_MS = "buffer_ms"
 
         /**

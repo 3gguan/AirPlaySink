@@ -1,5 +1,6 @@
 package com.shilapi.airplaysink
 
+import com.shilapi.airplaysink.ap2.Ap2Streams
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
@@ -36,6 +37,23 @@ object SinkModel {
         val progressTotalSeconds: Int = 0,
         /** True once the sender has handed over a usable DACP reverse control endpoint. */
         val remoteControl: Boolean = false,
+        /**
+         * The running receiver was started with the AirPlay 2 remote control switch on.
+         *
+         * Read from the service, not from the preference: the switch changes the preference first
+         * and the running receiver only after the restart.
+         */
+        val ap2RemoteEnabled: Boolean = false,
+        /** The sender opened the encrypted event connection that `POST /command` travels on. */
+        val eventChannelOpen: Boolean = false,
+        /** How the last remote command the UI sent ended; null until one has been sent. */
+        val remoteCommandResult: Ap2Streams.Delivery? = null,
+        /**
+         * The phone's status line for that command, e.g. `RTSP/1.0 200`.
+         *
+         * Cleared on every new press, so a stale 200 can never make a dead command look accepted.
+         */
+        val ap2CommandReply: String? = null,
         /** The cushion the receiver was started with, in milliseconds. */
         val bufferMs: Int = 250,
         val lastError: String? = null,
