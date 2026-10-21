@@ -110,6 +110,10 @@ class AudioPipeline(
          * The sender only holds a few seconds of the current track, so beyond this a "resend" is
          * asking for audio that is already gone; 900 ms is generous against every measurement made
          * here (the deepest burst seen was ~400 ms).
+         *
+         * This is a ceiling, not the figure that gets waited: what is actually spent is capped by
+         * the audio in hand (see [GapWait.budgetMs]). At a two-second cushion the ceiling is
+         * exactly what 900 ms was written for, and at 660 ms of AudioTrack it never binds.
          */
         const val MAX_GAP_WAIT_MS = 900L
 
@@ -121,11 +125,28 @@ class AudioPipeline(
         const val LATE_WINDOW_PACKETS = 64L
 
         /**
-         * Waiting for a gap is paid for out of the audio in hand, so it stops being a good trade
-         * once little is left. Below this floor the wait would turn a small splice into an audible
-         * dropout instead of preventing one.
+         * What a gap wait must leave in the AudioTrack when it gives up.
+         *
+         * The wait is paid for out of the audio in hand, and that same audio is the only thing
+         * that rides out the *next* burst — so a wait that spends all of it turns a splice into an
+         * underrun and leaves the buffer too thin to absorb anything that follows.
+         *
+         * This used to be 80 ms, and it was checked once before a single 900 ms [waitLocked]: the
+         * check was therefore a statement about the cushion *before* the wait, not during it. The
+         * 2026-10-21 session shows the result — `buffered` fell from 665 ms to 62 ms on every
+         * write-off, one in thirty samples sat below 150 ms, and one of them underran outright.
+         * 250 ms is the default cushion: a write-off may now cost at most the audio it set out to
+         * protect, and the recovery room is what it was always supposed to be.
          */
-        const val GAP_WAIT_FLOOR_MS = 80L
+        const val GAP_WAIT_RESERVE_MS = 250L
+
+        /**
+         * The longest single sleep inside a gap wait, after which the cushion is measured again.
+         *
+         * Between 50 ms slices the loop re-reads [bufferedFramesLocked] and shortens its own
+         * budget, so a burst that stops arriving costs the reserve and no more.
+         */
+        const val GAP_WAIT_SLICE_MS = 50L
 
         /**
          * Packets written in place of a hole that is being given up on, imitating the last frame
@@ -199,6 +220,19 @@ class AudioPipeline(
         const val MAX_DECODE_FAILURE_LOGS = 10
 
         /**
+         * How many write-offs are described one by one before switching to a periodic summary.
+         *
+         * Being rare is what makes each one worth its own line — but a bad link makes them common,
+         * and the rule that silences them at ten is how the 2026-10-21 session hid 1400 lost
+         * packets: the counter in the stats line proves a loss happened and says nothing about
+         * when, how large, or how much cushion was left when it did.
+         */
+        const val MAX_GAP_LOG_LINES = 10
+
+        /** How often the rest are summarised, in the same spirit as the stats line. */
+        const val GAP_SUMMARY_INTERVAL_MS = 60_000L
+
+        /**
          * How far the sequence may jump before it stops looking like a loss.
          *
          * A lost packet is a hole of one or two, occasionally a few dozen when the link is bad.
@@ -216,12 +250,17 @@ class AudioPipeline(
     private val prebufferTimeoutMs = cushionMs + PREBUFFER_TIMEOUT_MS
 
     /**
-     * How long a hole is waited for at this cushion.
+     * How long a hole may be waited for at this cushion — the ceiling, not the spend.
      *
      * Three quarters of the cushion, clamped to [GAP_WAIT_MS]..[MAX_GAP_WAIT_MS]. The transport
      * sizes its retry schedule from this as well, so a deep buffer does not just sit there being
      * deep — it buys more chances for a lost packet to come back before the hole is written off,
      * which is the only way the setting can actually reduce what is heard as a pop.
+     *
+     * The cushion lives in the pending queue as compressed packets; the wait, however, is paid for
+     * in decoded audio sitting in the AudioTrack, which is a fixed one second regardless of this
+     * value. The two are therefore not interchangeable, and [GapWait.budgetMs] is what turns this
+     * ceiling into something the speaker can actually afford.
      */
     val gapWaitMs: Long = (cushionMs * 3L / 4L).coerceIn(GAP_WAIT_MS, MAX_GAP_WAIT_MS)
 
@@ -265,6 +304,12 @@ class AudioPipeline(
     private var decodedPackets = 0L
     private var receivedPackets = 0L
     private var skippedPackets = 0L
+
+    // Write-off reporting; see [MAX_GAP_LOG_LINES] and [GAP_SUMMARY_INTERVAL_MS].
+    private var writeOffLines = 0
+    private var gaveUpPackets = 0L
+    private var gaveUpGaps = 0L
+    private var lastGapReportAt = 0L
 
     /** How many failed decodes have been described in the log so far; see [MAX_DECODE_FAILURE_LOGS]. */
     private var decodeFailures = 0
@@ -729,6 +774,10 @@ class AudioPipeline(
             decodedPackets = 0L
             receivedPackets = 0L
             skippedPackets = 0L
+            writeOffLines = 0
+            gaveUpPackets = 0L
+            gaveUpGaps = 0L
+            lastGapReportAt = 0L
             recoveredPackets = 0L
             tooLatePackets = 0L
             concealedPackets = 0L
@@ -1042,12 +1091,18 @@ class AudioPipeline(
         // The packet we want is missing while later ones are sitting right there: a reorder, or a
         // loss whose retransmission may already be on its way back. Hold on for it — but only on
         // time we can actually afford. The wait is paid out of the audio in hand, so once that has
-        // thinned to the floor the trade stops being worthwhile and moving on wins.
+        // thinned to the reserve the trade stops being worthwhile and moving on wins.
+        //
+        // The budget is recomputed on every slice rather than once per gap: the cushion falls
+        // while the wait runs, so a limit measured only at the start describes the wrong number,
+        // and one long sleep would spend the whole reservoir before looking again.
         val now = SystemClock.elapsedRealtime()
         if (gapSince == 0L) gapSince = now
         val waited = now - gapSince
-        if (waited < gapWaitMs && bufferedFramesLocked() >= gapWaitFloorFrames) {
-            waitLocked((gapWaitMs - waited).coerceAtLeast(1L))
+        val bufferedMs = bufferedFramesLocked() * 1000 / sampleRate
+        val budgetMs = GapWait.budgetMs(bufferedMs, gapWaitMs, GAP_WAIT_RESERVE_MS)
+        if (waited < budgetMs) {
+            waitLocked(GapWait.sleepMs(budgetMs - waited, GAP_WAIT_SLICE_MS))
             return null
         }
 
@@ -1078,21 +1133,38 @@ class AudioPipeline(
         // is only convincing for a few packets — beyond that it is noise of its own.
         pendingConceal = lost.coerceAtMost(MAX_CONCEAL_PACKETS.toLong()).toInt()
         // Skipping is the one thing here that permanently costs the cushion, and each skip is a
-        // packet's worth of audio the listener will not hear, so say so while it is rare. Once it
-        // is not rare the stats line carries the count and this would only be noise.
-        if (skippedPackets <= 10) {
+        // packet's worth of audio the listener will not hear, so the first few get their own line.
+        // After that they are summarised: going quiet at ten is how a whole session's losses
+        // became invisible, and the summary keeps the cost of a bad link out of the log without
+        // hiding it.
+        gaveUpPackets += lost
+        gaveUpGaps++
+        if (writeOffLines < MAX_GAP_LOG_LINES) {
+            writeOffLines++
             SinkLog.w(
-                "Gave up on $lost packet(s) at seq $nextSequence after waiting ${waited}ms " +
-                    "(buffered ${bufferedFramesLocked() * 1000 / sampleRate}ms, " +
-                    "queued ${pending.size})",
+                "Gave up on $lost packet(s) at seq $jump after waiting ${waited}ms " +
+                    "(buffered ${bufferedMs}ms, budget ${budgetMs}ms, queued ${pending.size})",
             )
+        } else if (lastGapReportAt == 0L) {
+            // Open the summary window here rather than at the tenth line: the individual lines are
+            // already on the record, and counting them again would inflate the first summary.
+            lastGapReportAt = now
+            gaveUpPackets = 0L
+            gaveUpGaps = 0L
+        } else if (now - lastGapReportAt >= GAP_SUMMARY_INTERVAL_MS) {
+            SinkLog.w(
+                "Gave up on $gaveUpPackets packet(s) in $gaveUpGaps gap(s) over the last " +
+                    "${(now - lastGapReportAt) / 1000}s (last $lost at seq $jump, " +
+                    "buffered ${bufferedMs}ms, budget ${budgetMs}ms)",
+            )
+            lastGapReportAt = now
+            gaveUpPackets = 0L
+            gaveUpGaps = 0L
         }
         nextSequence = jump
         gapSince = 0L
         return null
     }
-
-    private val gapWaitFloorFrames: Long get() = sampleRate / 1000 * GAP_WAIT_FLOOR_MS
 
     /** Must be called while holding [lock]. */
     private fun waitLocked(timeoutMs: Long) {
