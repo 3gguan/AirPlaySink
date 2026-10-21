@@ -954,7 +954,11 @@ class RaopSession(
             pipeline = audioPipeline,
             sessionKey = sessionKey,
             sessionIv = info.aesIv,
-            maxResendAttempts = RaopAudioTransport.attemptsFor(audioPipeline.gapWaitMs),
+            // The retransmission window is what is left of the cushion once the speaker's share is
+            // taken out — shairport-sync's `conn->latency = stream latency - backend buffer`
+            // (`rtp.c:1656`). A hole can be chased for that long, because that is how long the
+            // audio sits in the queue before the playhead reaches it.
+            queueWindowMs = (config.cushionMs - audioPipeline.backendBufferMs).coerceAtLeast(0L),
         )
         pipeline = audioPipeline
         transport = audioTransport
@@ -967,9 +971,8 @@ class RaopSession(
                 "timing=${timing.localAddress.hostAddress}:${timing.localPort}",
         )
         SinkLog.i(
-            "SETUP: cushion ${config.cushionMs}ms, gap window ${audioPipeline.gapWaitMs}ms, " +
-                "up to ${audioTransport.maxResendAttempts} resend attempts, " +
-                "Audio-Latency will be $audioLatencyFrames frames",
+            "SETUP: cushion ${config.cushionMs}ms, retransmission window " +
+                "${audioTransport.queueWindowMs}ms, Audio-Latency will be $audioLatencyFrames frames",
         )
 
         return RtspResponse(200)

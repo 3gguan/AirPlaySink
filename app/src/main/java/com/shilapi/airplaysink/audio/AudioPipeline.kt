@@ -14,13 +14,15 @@ import java.io.Closeable
  * Re-orders incoming RAOP audio packets, decodes them with [AlacDecoder] and pushes PCM into an
  * [AudioTrack].
  *
- * Pacing comes for free: `AudioTrack.write` in stream mode blocks once its internal buffer is full,
- * so the decode loop runs at playback speed as long as the sender keeps the network pace.
+ * Two clocks run here, and the design is shairport-sync's: a packet waits in the queue until its
+ * own RTP-timestamped instant comes round, then it is handed to the speaker, which holds
+ * [BACKEND_BUFFER_MS] of it. The playhead is therefore never "kept fed" — it is *scheduled*, and
+ * the amount of audio in hand is whatever the sender's latency minus the backend happens to be.
  *
- * That same property is what makes the pre-buffer the *only* thing standing between the network and
- * the speaker. The sender paces its stream at real time and never hands over a surplus, so nothing
- * refills the pipeline once playback is under way: whatever is queued before [decodeLoop] starts
- * writing is what the rest of the track runs on. See [TARGET_CUSHION_MS].
+ * Nothing here ever pauses to rebuild that. A hole in the sequence is written out as silence and
+ * stepped over the moment it reaches the playhead; the retransmission that may still recover it is
+ * chased separately, by [ResendTracker], on the network thread. That way a lost packet costs a
+ * short silence at worst, and never stalls the stream behind it.
  */
 class AudioPipeline(
     private val sampleRate: Int = 44100,
@@ -76,46 +78,20 @@ class AudioPipeline(
         const val STATS_INTERVAL_PACKETS = 500L
 
         /**
-         * How long a missing sequence is waited for before the pipeline writes it off and jumps
-         * forward to what did arrive.
+         * How much decoded audio the speaker holds, in milliseconds — shairport-sync's
+         * `audio_backend_buffer_desired_length`.
          *
-         * The transport has already asked the sender to resend it by the time the hole reaches this
-         * class, and over a hotspot the reply is back in single-digit milliseconds — so this window
-         * is deliberately generous. Jumping the moment the expected packet is not the head of the
-         * queue is what turns a perfectly recoverable hiccup into a splice in the output, and it is
-         * also what made the whole resend path pointless: the retransmission always arrived after
-         * playback had already been moved past it and was dropped on sight.
+         * This is the only "level" the pipeline maintains, and it is a fixed figure rather than
+         * something derived from the cushion. It is the boundary on the timeline: a packet is
+         * handed over `BACKEND_BUFFER_MS` before the instant the sender stamped it for, so the
+         * playhead and the write head stay a fixed distance apart no matter how deep the queue is.
          *
-         * The wait is paid for out of the cushion, and the cushion is a full [TARGET_CUSHION_MS]
-         * whenever bursts keep topping it up — measured 296-370 ms in hand at the moment this
-         * window ran out on the head unit, i.e. the old 120 ms was leaving recovery time on the
-         * table for no reason. `tooLate` in the stats line is the check on this number: it counts
-         * retransmissions that arrived after playback had already gone past them. If it climbs in
-         * step with `skipped`, this window is still too short. If it stays at zero, the sender is
-         * not answering and no wait will help.
-         *
-         * At 150 ms the reservoir still had 365 ms at its lowest over a measured 37 minutes, and
-         * about one gap in twelve was still being written off; 200 ms covers the fourth resend
-         * request the transport sends at 135 ms, which is the last one that can land in time.
-         *
-         * This is the floor, not the figure in use: see [gapWaitMs]. A cushion deep enough to hold
-         * two seconds can afford to chase a burst for half a second, and doing so is the whole
-         * point of asking for the bigger cushion.
+         * 660 ms is what this platform can hold without underrunning: the AudioTrack ring itself is
+         * one second (`AudioTrack.getMinBufferSize` rounds up to it), and the decode thread has to
+         * survive being descheduled by AudioFlinger. shairport-sync uses 150 ms, which is right for
+         * a direct ALSA write and far too thin behind an Android mixer.
          */
-        const val GAP_WAIT_MS = 200L
-
-        /**
-         * The most a hole may ever be waited for, in milliseconds.
-         *
-         * The sender only holds a few seconds of the current track, so beyond this a "resend" is
-         * asking for audio that is already gone; 900 ms is generous against every measurement made
-         * here (the deepest burst seen was ~400 ms).
-         *
-         * This is a ceiling, not the figure that gets waited: what is actually spent is capped by
-         * the audio in hand (see [GapWait.budgetMs]). At a two-second cushion the ceiling is
-         * exactly what 900 ms was written for, and at 660 ms of AudioTrack it never binds.
-         */
-        const val MAX_GAP_WAIT_MS = 900L
+        const val BACKEND_BUFFER_MS = 660L
 
         /**
          * How far behind the playback point a packet may be and still be called late rather than
@@ -125,57 +101,12 @@ class AudioPipeline(
         const val LATE_WINDOW_PACKETS = 64L
 
         /**
-         * What a gap wait must leave in the AudioTrack when it gives up.
+         * Samples over which the audio is faded back up after a hole.
          *
-         * The wait is paid for out of the audio in hand, and that same audio is the only thing
-         * that rides out the *next* burst — so a wait that spends all of it turns a splice into an
-         * underrun and leaves the buffer too thin to absorb anything that follows.
-         *
-         * This used to be 80 ms, and it was checked once before a single 900 ms [waitLocked]: the
-         * check was therefore a statement about the cushion *before* the wait, not during it. The
-         * 2026-10-21 session shows the result — `buffered` fell from 665 ms to 62 ms on every
-         * write-off, one in thirty samples sat below 150 ms, and one of them underran outright.
-         * 250 ms is the default cushion: a write-off may now cost at most the audio it set out to
-         * protect, and the recovery room is what it was always supposed to be.
-         */
-        const val GAP_WAIT_RESERVE_MS = 250L
-
-        /**
-         * The longest single sleep inside a gap wait, after which the cushion is measured again.
-         *
-         * Between 50 ms slices the loop re-reads [bufferedFramesLocked] and shortens its own
-         * budget, so a burst that stops arriving costs the reserve and no more.
-         */
-        const val GAP_WAIT_SLICE_MS = 50L
-
-        /**
-         * Packets written in place of a hole that is being given up on, imitating the last frame
-         * that did arrive.
-         *
-         * This is what keeps the cushion from being a one-way street. Nothing in this pipeline ever
-         * adds audio that the sender did not send, so every skipped packet took its 8 ms out of the
-         * cushion permanently and nothing paid it back: measured over 13 minutes of playback the
-         * cushion lost 114 ms while `skipped` gained 14 — a 2 % match, i.e. skipping is the *only*
-         * drain there is. A long session therefore always ends up here, cushion at zero and the
-         * AudioTrack underrunning on every hiccup. Writing a stand-in instead of dropping the
-         * packet leaves the cushion where it was, which is the whole point: a bad second costs a
-         * bad second, it does not poison the rest of the track.
-         *
-         * It caps at 8 because a stand-in is only convincing for a few packets — beyond that it is
-         * noise of its own.
-         */
-        const val MAX_CONCEAL_PACKETS = 8
-
-        /**
-         * Samples over which a stand-in is blended away from the sample the speaker is already
-         * holding, and over which the next real packet is faded back up.
-         *
-         * A stand-in is the previous frame repeated, so it starts on `frame[0]` while the speaker
-         * was left holding `frame[351]`: that difference is a step in the waveform, and a step in
-         * the waveform is exactly what a click is. Repeating the block at full level, which is what
-         * this used to do, made it worse in two ways at once — an audible 125 Hz buzz for the length
-         * of the hold, sandwiched between two steps. Fading the run out to silence and the audio
-         * back in costs 2 ms of level at the seam and removes both. 88 samples is 2 ms.
+         * The hole itself is silence, which is what shairport-sync writes too, but stepping from
+         * digital silence into a non-zero sample is a click at every seam. Neither end of that step
+         * needs a special mechanism: the silence run is faded out from whatever the speaker was
+         * holding, and the next real packet is faded in here. 88 samples is 2 ms.
          */
         const val DECLICK_FRAMES = 88
 
@@ -190,15 +121,6 @@ class AudioPipeline(
          * every track — the same defect as the seam above, at the other end of the stream.
          */
         const val START_FADE_IN_FRAMES = 220
-
-        /**
-         * Below this the cushion is too thin to ride out anything, and concealment alone will not
-         * dig it back out — it only stops the bleeding. Stop and refill instead.
-         */
-        const val REBUFFER_FLOOR_MS = 40L
-
-        /** Give up refilling after this long and carry on with whatever turned up. */
-        const val REBUFFER_TIMEOUT_MS = 1000L
 
         /**
          * The most a single packet may be held back waiting for its timestamped play instant.
@@ -250,19 +172,13 @@ class AudioPipeline(
     private val prebufferTimeoutMs = cushionMs + PREBUFFER_TIMEOUT_MS
 
     /**
-     * How long a hole may be waited for at this cushion — the ceiling, not the spend.
+     * The audio the speaker is handed, in frames: the fixed distance between write head and playhead.
      *
-     * Three quarters of the cushion, clamped to [GAP_WAIT_MS]..[MAX_GAP_WAIT_MS]. The transport
-     * sizes its retry schedule from this as well, so a deep buffer does not just sit there being
-     * deep — it buys more chances for a lost packet to come back before the hole is written off,
-     * which is the only way the setting can actually reduce what is heard as a pop.
-     *
-     * The cushion lives in the pending queue as compressed packets; the wait, however, is paid for
-     * in decoded audio sitting in the AudioTrack, which is a fixed one second regardless of this
-     * value. The two are therefore not interchangeable, and [GapWait.budgetMs] is what turns this
-     * ceiling into something the speaker can actually afford.
+     * Everything else the receiver holds stays in [pending] as compressed packets. The split is
+     * shairport-sync's (`audio_backend_buffer_desired_length` against the stream latency), and its
+     * value does not move: a deep cushion makes the *queue* deeper, never the speaker buffer.
      */
-    val gapWaitMs: Long = (cushionMs * 3L / 4L).coerceIn(GAP_WAIT_MS, MAX_GAP_WAIT_MS)
+    private val backendBufferFrames = sampleRate.toLong() * BACKEND_BUFFER_MS / 1000
 
     /** The same cushion expressed the way the queue counts, i.e. in packets. */
     private val prebufferPackets =
@@ -321,38 +237,28 @@ class AudioPipeline(
     /** The sequence of the packet just handed to the decode loop, for pacing. */
     private var lastTakenSequence = -1L
 
-    /** Holes at [nextSequence] that the wait below actually filled, i.e. resends that landed. */
-    private var recoveredPackets = 0L
-
     /**
-     * Packets that arrived after playback had already gone past them.
+     * Packets that arrived after the playhead had already stepped over them.
      *
-     * Only retransmissions can be this late, so this is the number that separates the two reasons a
-     * hole is ever given up on: the answer came back but [GAP_WAIT_MS] was too short (`tooLate`
-     * climbing with `skipped`), or the sender never answered at all (`tooLate` flat).
+     * The playhead never waits — a hole is written out as silence as soon as it is reached — so a
+     * retransmission only helps if it lands before that. This is the count of the ones that did
+     * not; it climbing alongside `skipped` is the sender answering too late to be of use, and it
+     * staying at zero while `skipped` climbs is the sender not answering at all.
      */
     private var tooLatePackets = 0L
     private var lastStatsAt = 0L
 
     /**
      * Frames handed to the AudioTrack since the last flush, and the playback head as it stood at
-     * that moment. Their difference is how much audio is still queued in front of the speaker,
-     * which is the only slack a gap can be waited for.
+     * that moment. Their difference is how much audio is still queued in front of the speaker.
      */
     private var writtenFrames = 0L
     private var headBaseFrames = 0L
 
-    /** When the hole at [nextSequence] was first noticed, or 0 while there is no hole. */
-    private var gapSince = 0L
+    /** Packets of silence the decode loop still owes for a hole it has already stepped over. */
+    private var pendingSilence = 0
 
-    /** Packets of stand-in audio the decode loop still owes, set when a hole is given up on. */
-    private var pendingConceal = 0
-
-    /** The last frame that decoded cleanly, in interleaved shorts — what a stand-in imitates. */
-    private val lastFrame = ShortArray(pcmFrames * maxOf(2, channels))
-    private var lastFrameShorts = 0
-
-    /** The last sample handed to the AudioTrack, per channel: where a stand-in has to begin. */
+    /** The last sample handed to the AudioTrack, per channel: where a silence run has to begin. */
     private val lastSamples = ShortArray(maxOf(2, channels))
 
     /**
@@ -364,9 +270,8 @@ class AudioPipeline(
     @Volatile
     private var fadeInFrames = 0
 
-    private val concealBuffer = ShortArray(pcmFrames * maxOf(2, channels))
-    private var concealedPackets = 0L
-    private var rebufferCount = 0L
+    private val silenceBuffer = ShortArray(pcmFrames * maxOf(2, channels))
+    private var silentPackets = 0L
 
     // --- RTP-timestamp-driven playback pacing -----------------------------------------
     //
@@ -385,15 +290,6 @@ class AudioPipeline(
     private var timingSynced = false
 
     /**
-     * Whether the cushion has ever reached its target since the last flush.
-     *
-     * The cushion starts at zero and takes the first few packets to build, so "below the floor" is
-     * the normal state for the first moment of every track and is not something to react to. Only
-     * a cushion that has *fallen* to the floor is worth stopping for.
-     */
-    private var primed = false
-
-    /**
      * Whether the sender's clock is running, which is the only thing that says whether *we* should
      * be playing.
      *
@@ -402,13 +298,6 @@ class AudioPipeline(
      * `ap2_play_enabled = 1`), clear means it is stopped. AirPlay 2 sends no sync packets at all, so
      * this is the *only* play/pause signal that exists — answering 200 and ignoring `rate` leaves
      * the pipeline playing through every pause and every seek.
-     *
-     * The damage is not subtle. Each pause is followed within ~150 ms by a `FLUSHBUFFERED`, which
-     * empties the queue and the AudioTrack; the pipeline then keeps writing packets into that
-     * emptied cushion as fast as they decode, so the speaker is handed silence while it waits for
-     * the sender to restart — the cushion falls from 500 ms to 1 ms, `Cushion down to 21ms;
-     * refilling` fires, and every one of those is an audible gap. Measured over a two-minute
-     * session of seeking: 14 underruns, all of them inside a pause window.
      *
      * True by default: a session that never sends `SETRATEANCHORTIME` (every classic RAOP sender)
      * must keep playing exactly as before.
@@ -421,24 +310,50 @@ class AudioPipeline(
      *
      * Stopping drops what is already in the speaker rather than letting it finish: the audio in the
      * track belongs to the position the sender is leaving, so playing it out is exactly the old
-     * track bleeding past the pause. Starting does not resume writing straight away — [primed] is
-     * cleared so the loop first rebuilds a cushion, which is what keeps the pause from turning into
-     * a dropout.
+     * track bleeding past the pause.
+     *
+     * Starting has two cases, and they are not the same. Pressing play again resumes the position
+     * that was just left, so the queue is still the cushion it was and writing carries straight on
+     * — stopping there would only hold up audio that is already in hand. A sender that jumped
+     * elsewhere while it was stopped needs the queue dropped, because everything in it belongs to
+     * the position being left.
+     *
+     * The queue is what tells them apart: after a resume its first block is the one the playhead
+     * was about to play, after a jump it is somewhere else, in either direction — hence a signed
+     * difference rather than a plain ordering.
      */
     fun setPlayEnabled(enabled: Boolean) {
         if (playEnabled == enabled) return
         playEnabled = enabled
         if (enabled) {
-            synchronized(lock) {
-                primed = false
-                firstPacketAt = 0L
+            val jumped = synchronized(lock) {
+                val firstQueued = if (pending.isEmpty()) -1L else pending.firstKey()
+                val resumes = nextSequence >= 0L && firstQueued >= 0L &&
+                    SeqNo.difference(firstQueued, nextSequence) in 0L..MAX_PENDING_PACKETS.toLong()
+                if (!resumes) {
+                    // Nothing queued can be played from the new position, and leaving it there
+                    // would make the pipeline take the old blocks as the start of the new
+                    // timeline — the previous track playing again, a few packets of it.
+                    pending.clear()
+                    nextSequence = -1L
+                    firstPacketAt = 0L
+                    firstRtpSequence = -1L
+                    firstRtpTime = 0L
+                    pendingSilence = 0
+                }
                 lock.notifyAll()
+                !resumes
             }
             fadeInFrames = START_FADE_IN_FRAMES
-            lastFrameShorts = 0
             java.util.Arrays.fill(lastSamples, 0)
             runCatching { track?.play() }
-            SinkLog.i("Audio output resumed — the sender restarted its clock; rebuilding the cushion")
+            SinkLog.i(
+                if (jumped) {
+                    "Audio output resumed at a new position — dropping the queue"
+                } else {
+                    "Audio output resumed — carrying on with the queue as it stands"
+                },
+            )
         } else {
             runCatching { track?.pause() }
             runCatching { track?.flush() }
@@ -458,6 +373,12 @@ class AudioPipeline(
 
     /** The sample rate in use, exposed so the transport can relate RTP timestamps to wall time. */
     val sampleRateHz: Int get() = sampleRate
+
+    /**
+     * What the speaker holds, in milliseconds — the figure the retransmission window is derived
+     * from. See [BACKEND_BUFFER_MS].
+     */
+    val backendBufferMs: Long get() = BACKEND_BUFFER_MS
 
     fun start() {
         if (running) return
@@ -507,15 +428,14 @@ class AudioPipeline(
 
         SinkLog.i(
             "Audio output started: ${codec.label} ${sampleRate}Hz ${channels}ch, " +
-                "AudioTrack buffer ${bufferSize} bytes (min ${minBuffer}); " +
-                "cushion target ${cushionMs}ms = $prebufferPackets packets of pre-buffer, " +
+                "AudioTrack buffer ${bufferSize} bytes (min ${minBuffer}), " +
+                "backend target ${BACKEND_BUFFER_MS}ms; " +
+                "cushion ${cushionMs}ms = $prebufferPackets packets of pre-buffer, " +
                 "starting if nothing better arrives within ${prebufferTimeoutMs}ms",
         )
         lastStatsAt = SystemClock.elapsedRealtime()
-        synchronized(lock) { primed = false }
         fadeInFrames = START_FADE_IN_FRAMES
         java.util.Arrays.fill(lastSamples, 0)
-        lastFrameShorts = 0
 
         thread = Thread({ decodeLoop() }, "raop-decode").also { it.start() }
     }
@@ -565,17 +485,14 @@ class AudioPipeline(
             }
             if (pending.size >= MAX_PENDING_PACKETS) {
                 // The queue is full: the sender is further ahead of us than we can hold. The
-                // oldest entry is the one the playhead is about to ask for, so dropping it would
-                // leave a hole exactly where the decode loop is waiting — and the wait for a hole
-                // that can no longer be filled is [gapWaitMs] long. Drop it and move the playhead
-                // to what is left: the audio in front of the playhead is stale by definition
-                // anyway, and the sender keeps pushing.
+                // oldest entry is the one the playhead is about to ask for, so drop it and move
+                // the playhead to what is left — the audio in front of the playhead is stale by
+                // definition anyway, and the sender keeps pushing.
                 val dropped = pending.pollFirstEntry()
                 if (dropped != null) {
                     skippedPackets++
                     if (dropped.key <= nextSequence && pending.isNotEmpty()) {
                         nextSequence = pending.firstKey()
-                        gapSince = 0L
                     }
                 }
             }
@@ -636,8 +553,7 @@ class AudioPipeline(
             nextSequence = -1L
             firstRtpSequence = -1L
             firstRtpTime = 0L
-            gapSince = 0L
-            pendingConceal = 0
+            pendingSilence = 0
             staleFrom = fromSeq
             staleUntil = untilSeq
             lock.notifyAll()
@@ -655,7 +571,6 @@ class AudioPipeline(
             writtenFrames = 0L
             headBaseFrames = currentHeadFrames()
         }
-        lastFrameShorts = 0
         java.util.Arrays.fill(lastSamples, 0)
         fadeInFrames = START_FADE_IN_FRAMES
         SinkLog.i(
@@ -672,9 +587,7 @@ class AudioPipeline(
             firstPacketAt = 0L
             firstRtpSequence = -1L
             firstRtpTime = 0L
-            gapSince = 0L
-            pendingConceal = 0
-            primed = false
+            pendingSilence = 0
             staleFrom = -1L
             staleUntil = -1L
             lock.notifyAll()
@@ -692,7 +605,6 @@ class AudioPipeline(
         }
         // The old timeline's last sample says nothing about the new one, and the new one starts
         // wherever the talker happens to be in its waveform: fade in rather than step.
-        lastFrameShorts = 0
         java.util.Arrays.fill(lastSamples, 0)
         fadeInFrames = START_FADE_IN_FRAMES
         paceDiagnosticsRemaining = 30
@@ -769,8 +681,7 @@ class AudioPipeline(
             firstPacketAt = 0L
             firstRtpSequence = -1L
             firstRtpTime = 0L
-            gapSince = 0L
-            pendingConceal = 0
+            pendingSilence = 0
             decodedPackets = 0L
             receivedPackets = 0L
             skippedPackets = 0L
@@ -778,15 +689,11 @@ class AudioPipeline(
             gaveUpPackets = 0L
             gaveUpGaps = 0L
             lastGapReportAt = 0L
-            recoveredPackets = 0L
             tooLatePackets = 0L
-            concealedPackets = 0L
-            rebufferCount = 0L
+            silentPackets = 0L
             flushedPackets = 0L
             staleFrom = -1L
             staleUntil = -1L
-            primed = false
-            lastFrameShorts = 0
             fadeInFrames = 0
             java.util.Arrays.fill(lastSamples, 0)
             writtenFrames = 0L
@@ -833,12 +740,17 @@ class AudioPipeline(
             }
 
             if (payload == null) {
+                // Nothing to decode. Either the queue is empty — the loop was woken by its timeout
+                // and no audio has arrived yet — or the playhead has just stepped over a hole.
+                // Only the second case owes the speaker anything, and it owes it silence: writing
+                // that keeps the timeline running instead of stalling behind a packet that may
+                // never come.
                 val owe = synchronized(lock) {
-                    val n = pendingConceal
-                    pendingConceal = 0
+                    val n = pendingSilence
+                    pendingSilence = 0
                     n
                 }
-                if (owe > 0 && !writeConcealed(owe)) return
+                if (owe > 0 && !writeSilence(owe)) return
                 continue
             }
 
@@ -866,7 +778,7 @@ class AudioPipeline(
             val player = track ?: continue
             val shorts = samples * channels
             applyFadeIn(out, shorts)
-            paceToTimeline()
+            holdUntilDue()
             val written = try {
                 player.write(out, 0, shorts)
             } catch (error: Exception) {
@@ -877,12 +789,9 @@ class AudioPipeline(
                 SinkLog.e("AudioTrack write returned $written; stopping pipeline")
                 return
             }
-            System.arraycopy(out, 0, lastFrame, 0, shorts)
-            lastFrameShorts = shorts
             rememberLastSamples(out, shorts)
             synchronized(lock) { writtenFrames += samples.toLong() }
             decodedPackets++
-            rebufferIfStarving()
             reportStatsIfDue()
         }
         SinkLog.i("Decode loop finished")
@@ -918,56 +827,62 @@ class AudioPipeline(
     }
 
     /**
-     * Holds the packet just decoded until the instant the sender timestamped it for.
+     * Holds the packet just decoded until the instant it is due to enter the speaker.
      *
-     * This is the whole of the progress-alignment fix. The sender paces its stream assuming the
-     * receiver plays each frame at the RTP-timestamped instant, so a receiver that plays on arrival
-     * runs *ahead* of where the sender thinks it is — the progress bar then lags the sound. Relating
-     * the RTP timestamp to the local clock and waiting out the difference brings the two together.
+     * shairport-sync's rule (`player.c:2682-2763`), which is a schedule rather than a level: a
+     * frame stamped `T` has to be in the backend by `T - BACKEND_BUFFER_MS`, so the playhead lands
+     * on `T` and the receiver stays aligned with the sender's idea of where the track is.
      *
-     * It only ever slows down: a packet whose instant has already passed plays immediately, so a
-     * thin cushion or a laggy link can never be made worse by this. And the wait is capped, so a
-     * bad anchor degrades to a short hesitation instead of stalling the speaker.
+     * Two branches, and the second is what keeps the guarantee: once the packet's instant has
+     * passed there is nothing left to wait for, and if the backend is short of its target the write
+     * goes in immediately regardless of the clock — the backend is refilled first, and the timeline
+     * is what it converges to. The wait is capped, so a bad anchor degrades to a short hesitation
+     * instead of stalling the speaker.
      */
-    private fun paceToTimeline() {
-        if (!timingSynced) return
-        val seq = lastTakenSequence
-        if (seq < 0L || firstRtpSequence < 0L) return
-        val rtpTime = firstRtpTime + (seq - firstRtpSequence) * framesPerPacket
-        // The anchor relates "frame nowRtpTime plays at anchorLocal" on the sender's timeline, so
-        // pacing the *write* to that instant aligns the write head, not the play head. The play head
-        // trails the write head by however much is still sitting in the AudioTrack (`buffered`), so
-        // the sound runs that far behind the sender — the progress bar stays that far ahead. Compensate
-        // by writing early: due = sender instant - buffered, so the *play head* lands on the sender's
-        // now-frame and the two line up.
-        val bufferedNs = synchronized(lock) { bufferedFramesLocked() } * 1_000_000_000L / sampleRate
-        val dueNs =
-            timingAnchorLocalNs + (rtpTime - timingAnchorRtpTime) * 1_000_000_000L / sampleRate - bufferedNs
-        val lateByNs = System.nanoTime() - dueNs
-        // Diagnose the first packets of a session so the residual lag is visible instead of
-        // guessed at: `lateByNs > 0` means the packet is already past its due instant (the receiver
-        // is running behind the sender's now-frame), which is the "progress still a touch off"
-        // symptom; `lateByNs < 0` means the receiver is ahead and this method will wait it out.
+    private fun holdUntilDue() {
+        val dueNs = dueNsFor(lastTakenSequence) ?: return
+        val behindNs = synchronized(lock) {
+            // shairport-sync's `current_buffer_delay < desired_buffer_latency` branch: the backend
+            // is below its target, so the next packet goes in now and the level is restored before
+            // the schedule is consulted again.
+            if (bufferedFramesLocked() < backendBufferFrames) return
+            System.nanoTime() - dueNs
+        }
         if (paceDiagnosticsRemaining > 0) {
             paceDiagnosticsRemaining--
             SinkLog.i(
-                "Pace seq=$seq rtp=$rtpTime lateBy=${lateByNs / 1_000_000}ms " +
-                    "(due=${dueNs} now=${System.nanoTime()})",
+                "Pace seq=$lastTakenSequence lateBy=${behindNs / 1_000_000}ms " +
+                    "(due=$dueNs now=${System.nanoTime()})",
             )
         }
-        if (lateByNs >= 0L) return
-        // `lateByNs < 0` means the due instant is still ahead: wait it out. The wait is the
-        // *negative* of `lateByNs` — a signed division here would yield a negative `waitMs` that
-        // the `<= 0` guard below silently drops, so the ahead-branch never slept and the decode
-        // loop sprinted through the pending queue until the AudioTrack filled, running the speaker
-        // ahead of the sender's timeline. That is the last remaining "progress still a touch off".
-        val waitMs = (-lateByNs / 1_000_000L).coerceAtMost(MAX_PACE_WAIT_MS)
+        if (behindNs >= 0L) return
+        // `behindNs < 0` means the due instant is still ahead: wait it out. A signed division here
+        // would yield a negative figure that the guard below silently drops, which once let the
+        // decode loop sprint through the queue and run the speaker ahead of the sender.
+        val waitMs = (-behindNs / 1_000_000L).coerceAtMost(MAX_PACE_WAIT_MS)
         if (waitMs <= 0L) return
         try {
             Thread.sleep(waitMs)
         } catch (_: InterruptedException) {
             // The loop is about to wind down anyway; don't let a stray interrupt escape.
         }
+    }
+
+    /**
+     * The local instant at which the packet [sequence] is due to enter the speaker, or null when
+     * the timeline is not known yet.
+     *
+     * The sender stamps every frame with an RTP timestamp and, through the sync packet and the
+     * measured clock offset, says which local instant each frame is for. Subtracting the backend
+     * target turns "when it should be heard" into "when it has to be handed over".
+     */
+    private fun dueNsFor(sequence: Long): Long? {
+        if (!timingSynced) return null
+        if (sequence < 0L || firstRtpSequence < 0L) return null
+        val rtpTime = firstRtpTime + (sequence - firstRtpSequence) * framesPerPacket
+        val playNs =
+            timingAnchorLocalNs + (rtpTime - timingAnchorRtpTime) * 1_000_000_000L / sampleRate
+        return playNs - backendBufferFrames * 1_000_000_000L / sampleRate
     }
 
     /** Number of leading packets whose pacing the decoder reports before going quiet. */
@@ -982,168 +897,106 @@ class AudioPipeline(
      * Frames are accounted for exactly as real ones are, which is the point: the cushion neither
      * gains nor loses here.
      */
-    private fun writeConcealed(count: Int): Boolean {
+    private fun writeSilence(count: Int): Boolean {
         val player = track ?: return false
-        // A packet's worth of samples, taken from the last one that decoded so the stand-in has the
-        // same shape as the audio either side of it. Before anything has decoded there is nothing
-        // to imitate and the length has to come from the format instead.
-        val bodyShorts = if (lastFrameShorts > 0) lastFrameShorts else framesPerPacket * channels
-        val bodyFrames = bodyShorts / channels
+        val bodyFrames = framesPerPacket
         if (bodyFrames <= 0 || count <= 0) return true
-        val totalFrames = bodyFrames.toLong() * count
+        val bodyShorts = bodyFrames * channels
+        if (silenceBuffer.size < bodyShorts) return true
 
         for (packet in 0 until count) {
-            var index = 0
-            for (frame in 0 until bodyFrames) {
-                val position = packet.toLong() * bodyFrames + frame
-                // Unity at the top of the hole, silence at the bottom: the last sample handed over
-                // is zero, so the packet after the hole has nothing to step away from.
-                val envelope =
-                    if (totalFrames > 1) 1f - position.toFloat() / totalFrames else 0f
-                // And the first sample *is* the one the speaker is holding, blended away over
-                // DECLICK_FRAMES. Without this the stand-in opens with the step it exists to hide.
-                val bridge = (1f - position.toFloat() / DECLICK_FRAMES).coerceAtLeast(0f)
-                for (channel in 0 until channels) {
-                    val source =
-                        if (lastFrameShorts > 0) lastFrame[frame * channels + channel].toFloat()
-                        else 0f
-                    val value = (source + (lastSamples[channel] - source) * bridge) * envelope
-                    concealBuffer[index++] = value.toInt().toShort()
+            java.util.Arrays.fill(silenceBuffer, 0)
+            if (packet == 0) {
+                // The run opens with the sample the speaker is still holding and blends it away
+                // over DECLICK_FRAMES, so the step into silence is a ramp rather than a click.
+                // shairport-sync writes plain silence here, which is right for its own backend;
+                // this one has to hide the seam itself.
+                val bridge = minOf(DECLICK_FRAMES, bodyFrames)
+                for (frame in 0 until bridge) {
+                    val gain = 1f - frame.toFloat() / bridge
+                    val base = frame * channels
+                    for (channel in 0 until channels) {
+                        silenceBuffer[base + channel] =
+                            (lastSamples[channel] * gain).toInt().toShort()
+                    }
                 }
             }
             val written = try {
-                player.write(concealBuffer, 0, index)
+                player.write(silenceBuffer, 0, bodyShorts)
             } catch (error: Exception) {
                 SinkLog.e("AudioTrack write failed while filling a hole", error)
                 -1
             }
             if (written < 0) return false
-            rememberLastSamples(concealBuffer, index)
+            rememberLastSamples(silenceBuffer, bodyShorts)
             synchronized(lock) { writtenFrames += bodyFrames.toLong() }
         }
-        // The hole ends at silence; ease the next real packet up out of it.
+        // Silence is what the speaker now holds; ease the next real packet up out of it.
         fadeInFrames = FADE_IN_FRAMES
-        concealedPackets += count
+        silentPackets += count
         return true
     }
 
     /**
-     * Concealment stops the cushion from draining; it cannot put back what was already lost. When
-     * it has been eaten down to nearly nothing, stop, let packets pile up and start again with a
-     * full cushion — one clean gap instead of an unending run of dropouts.
+     * Takes the packet at [nextSequence], or steps over the hole where it should be.
+     *
+     * Never waits, and that is the whole difference from what this used to do. shairport-sync's
+     * `buffer_get_frame` only waits for a packet that is actually *there* — `curframe->ready` gates
+     * the wait — and when the slot is empty it substitutes silence and advances `ab_read` on the
+     * spot (`player.c:2809-2816`). Doing the same here means a loss costs one short hole instead of
+     * stalling the stream behind it, and the retransmission gets the whole queue as its window
+     * rather than whatever a gap wait could afford out of the speaker buffer.
+     *
+     * Must be called while holding [lock].
      */
-    private fun rebufferIfStarving() {
-        val player = track ?: return
-        val starving = synchronized(lock) {
-            val current = bufferedFramesLocked()
-            if (current >= targetCushionFrames) primed = true
-            // A pause can only help if the audio is still missing. When the queue already holds a
-            // cushion's worth, the packets are here — they simply have not been written yet, and
-            // the loop resumes writing them at once. Pausing in that case buys nothing and, worse,
-            // the wait below is satisfied before it starts, so the refill returns immediately,
-            // `primed` is still true and the very next packet starts the whole thing again:
-            // after a FLUSH this ran ten pause/play cycles in fifty milliseconds.
-            primed && nextSequence >= 0L && current < rebufferFloorFrames &&
-                pending.size < effectivePrebufferPackets
-        }
-        if (!starving) return
-
-        // It has to earn its way back in by rebuilding the cushion, otherwise a pipeline that
-        // really is starving re-enters here on every packet it writes and never gets anywhere.
-        synchronized(lock) { primed = false }
-        rebufferCount++
-        SinkLog.w(
-            "Cushion down to ${synchronized(lock) { bufferedFramesLocked() * 1000 / sampleRate }}ms; " +
-                "refilling (refill #$rebufferCount)",
-        )
-        runCatching { player.pause() }
-        synchronized(lock) {
-            val deadline = SystemClock.elapsedRealtime() + REBUFFER_TIMEOUT_MS
-            while (running && pending.size < effectivePrebufferPackets &&
-                SystemClock.elapsedRealtime() < deadline
-            ) {
-                waitLocked(20)
-            }
-        }
-        runCatching { player.play() }
-    }
-
-    private val rebufferFloorFrames: Long get() = sampleRate / 1000 * REBUFFER_FLOOR_MS
-
-    /** Must be called while holding [lock]. */
     private fun takeNextLocked(): ByteArray? {
         while (pending.isNotEmpty() && pending.firstKey() < nextSequence) {
             pending.pollFirstEntry()
         }
         val exact = pending.remove(nextSequence)
         if (exact != null) {
-            if (gapSince != 0L) recoveredPackets++
             lastTakenSequence = nextSequence
             nextSequence++
-            gapSince = 0L
             return exact
         }
-        if (pending.isEmpty()) {
-            gapSince = 0L
-            return null
-        }
-
-        // The packet we want is missing while later ones are sitting right there: a reorder, or a
-        // loss whose retransmission may already be on its way back. Hold on for it — but only on
-        // time we can actually afford. The wait is paid out of the audio in hand, so once that has
-        // thinned to the reserve the trade stops being worthwhile and moving on wins.
-        //
-        // The budget is recomputed on every slice rather than once per gap: the cushion falls
-        // while the wait runs, so a limit measured only at the start describes the wrong number,
-        // and one long sleep would spend the whole reservoir before looking again.
-        val now = SystemClock.elapsedRealtime()
-        if (gapSince == 0L) gapSince = now
-        val waited = now - gapSince
-        val bufferedMs = bufferedFramesLocked() * 1000 / sampleRate
-        val budgetMs = GapWait.budgetMs(bufferedMs, gapWaitMs, GAP_WAIT_RESERVE_MS)
-        if (waited < budgetMs) {
-            waitLocked(GapWait.sleepMs(budgetMs - waited, GAP_WAIT_SLICE_MS))
-            return null
-        }
+        if (pending.isEmpty()) return null
 
         val jump = pending.firstKey()
         val lost = jump - nextSequence
         if (lost > TIMELINE_RESYNC_PACKETS) {
             // A hole this large is not a loss. The sender has moved to a different part of the
             // stream — a seek, or a flush we did not hear about — and the old sequence numbers
-            // are never coming. Booking them as thousands of lost packets, and writing stand-in
-            // audio for them, is worse than useless: it stalls the speaker for the whole wait and
-            // then plays silence where music should be.
-            //
-            // So the playhead moves to what actually arrived, the timeline is re-anchored on it,
-            // and the count of lost packets stays where it was.
+            // are never coming. Writing hundreds of packets of silence for them would stall the
+            // speaker and then play silence where music should be, so the playhead simply moves to
+            // what arrived and the timeline is re-anchored on it.
             SinkLog.w(
                 "Sequence jumped forward by $lost; treating it as a new position rather than a " +
                     "loss, and re-anchoring on sequence $jump",
             )
             nextSequence = jump
-            gapSince = 0L
             firstRtpSequence = -1L
             firstRtpTime = 0L
             return null
         }
+
         skippedPackets += lost
-        // The hole is still not filled, but it is no longer left empty: the decode loop writes a
-        // stand-in for it so the cushion survives. Caps at MAX_CONCEAL_PACKETS because a stand-in
-        // is only convincing for a few packets — beyond that it is noise of its own.
-        pendingConceal = lost.coerceAtMost(MAX_CONCEAL_PACKETS.toLong()).toInt()
-        // Skipping is the one thing here that permanently costs the cushion, and each skip is a
-        // packet's worth of audio the listener will not hear, so the first few get their own line.
-        // After that they are summarised: going quiet at ten is how a whole session's losses
-        // became invisible, and the summary keeps the cost of a bad link out of the log without
-        // hiding it.
+        // The decode loop owes the speaker one packet of silence per lost sequence, written as soon
+        // as it is handed the bill. The hole is bounded by [TIMELINE_RESYNC_PACKETS] above, so this
+        // cannot become a long run of silence by accident.
+        pendingSilence = lost.toInt()
+        val now = SystemClock.elapsedRealtime()
+        val bufferedMs = bufferedFramesLocked() * 1000 / sampleRate
+        // Each loss is a packet's worth of audio nobody will hear, so the first few get their own
+        // line. After that they are summarised: going quiet at ten is how a whole session's losses
+        // once became invisible, and the summary keeps the cost of a bad link out of the log
+        // without hiding it.
         gaveUpPackets += lost
         gaveUpGaps++
         if (writeOffLines < MAX_GAP_LOG_LINES) {
             writeOffLines++
             SinkLog.w(
-                "Gave up on $lost packet(s) at seq $jump after waiting ${waited}ms " +
-                    "(buffered ${bufferedMs}ms, budget ${budgetMs}ms, queued ${pending.size})",
+                "Stepped over $lost packet(s) at seq $jump " +
+                    "(buffered ${bufferedMs}ms, queued ${pending.size})",
             )
         } else if (lastGapReportAt == 0L) {
             // Open the summary window here rather than at the tenth line: the individual lines are
@@ -1153,16 +1006,15 @@ class AudioPipeline(
             gaveUpGaps = 0L
         } else if (now - lastGapReportAt >= GAP_SUMMARY_INTERVAL_MS) {
             SinkLog.w(
-                "Gave up on $gaveUpPackets packet(s) in $gaveUpGaps gap(s) over the last " +
+                "Stepped over $gaveUpPackets packet(s) in $gaveUpGaps hole(s) over the last " +
                     "${(now - lastGapReportAt) / 1000}s (last $lost at seq $jump, " +
-                    "buffered ${bufferedMs}ms, budget ${budgetMs}ms)",
+                    "buffered ${bufferedMs}ms)",
             )
             lastGapReportAt = now
             gaveUpPackets = 0L
             gaveUpGaps = 0L
         }
         nextSequence = jump
-        gapSince = 0L
         return null
     }
 
@@ -1205,8 +1057,7 @@ class AudioPipeline(
         // climbing, the stutter is real and it is starvation, not congestion.
         val underruns = runCatching { track?.underrunCount ?: 0 }.getOrDefault(0)
         val stats = "received $received packets, decoded $decodedPackets, " +
-            "skipped $skippedPackets, " +
-            "recovered $recoveredPackets, concealed $concealedPackets, tooLate $tooLatePackets, " +
+            "skipped $skippedPackets, silence $silentPackets, tooLate $tooLatePackets, " +
             "flushed $flushedPackets, " +
             "queued $queued, buffered ${bufferedMs}ms, underruns $underruns"
         SinkLog.i(stats)

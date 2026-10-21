@@ -1,6 +1,9 @@
 package com.shilapi.airplaysink.ap2
 
+import android.os.SystemClock
 import com.shilapi.airplaysink.audio.AudioCodec
+import com.shilapi.airplaysink.audio.Resend
+import com.shilapi.airplaysink.audio.ResendTracker
 import com.shilapi.airplaysink.net.LocalNetwork
 import com.shilapi.airplaysink.rtsp.RtspReader
 import com.shilapi.airplaysink.rtsp.RtspResponse
@@ -116,6 +119,18 @@ class Ap2Streams(
         private const val TAG_BYTES = 16
         private const val NONCE_BYTES = 8
         private const val OVERHEAD = RTP_HEADER_BYTES + TAG_BYTES + NONCE_BYTES
+
+        /** Apple's retransmission reply, the same type the RAOP control socket carries. */
+        private const val TYPE_RESEND_REPLY = 0x56
+
+        /**
+         * How often the audio thread wakes while nothing is arriving.
+         *
+         * A hole at the end of a burst has no following packet to ride on, so without a tick of its
+         * own its request would wait for the next packet — which may be the very one that never
+         * comes.
+         */
+        private const val IDLE_TICK_MS = 20
     }
 
     /** The minimum the decoder needs; anything else in the SETUP is ignored. */
@@ -182,6 +197,25 @@ class Ap2Streams(
 
     private var audioFrames = 0
     private var realtimePackets = 0
+
+    /**
+     * Retransmission, for the realtime stream only.
+     *
+     * The buffered stream is TCP: the kernel repeats anything lost, so asking again there would
+     * only duplicate what is already on its way.
+     */
+    private val resend = ResendTracker()
+
+    /** Where the sender takes requests. Both come from the stream SETUP and the audio it sends. */
+    private var senderControlPort = 0
+    private var senderAddress: InetAddress? = null
+
+    /** Per-stream counters, so each line in the log describes one play, not the process. */
+    private var resendRequests = 0L
+    private var resendReplies = 0L
+
+    /** When the socket may be tried again after a failed send; see [sendResend]. */
+    private var resendBlockedUntil = 0L
 
     /**
      * Answers one `SETUP`. The plist is returned as the reply body, or null when the request names
@@ -518,6 +552,15 @@ class Ap2Streams(
         realtimePackets = 0
         decryptFailures = 0
 
+        // Retransmission: where the sender takes requests, and a clean slate for the new stream.
+        // `controlPort` here is the *sender's* control port, not the one handed out below.
+        senderControlPort = (stream["controlPort"] as? Long)?.toInt() ?: 0
+        senderAddress = null
+        resend.reset()
+        resendRequests = 0
+        resendReplies = 0
+        resendBlockedUntil = 0
+
         // Both stream types keep an RTCP control port next to the audio port. Nothing acts on what
         // arrives there — playback is driven by the audio itself — but the port has to exist and be
         // drained, or the socket buffer fills and the sender's RTCP starts backing up.
@@ -629,22 +672,37 @@ class Ap2Streams(
     /**
      * Realtime audio: one RTP packet per datagram, arriving at playback pace.
      *
-     * Nothing here resends or reorders beyond what the pipeline already does for RAOP — the sender
-     * would rather drop a packet than delay the stream.
+     * UDP means a lost packet is simply gone, and this sender never repeats one on its own. The
+     * only recovery the protocol offers is to name the missing sequence numbers and let the sender
+     * answer from what it still holds — which is what [ResendTracker] decides and [sendResend]
+     * puts on the wire. The socket is woken on a timer as well as by packets so that a hole with
+     * nothing behind it is still asked about.
      */
     private fun serveRealtime(socket: DatagramSocket) {
         val buffer = ByteArray(MAX_FRAME_BYTES)
+        runCatching { socket.soTimeout = IDLE_TICK_MS }
         while (!closed.get()) {
             val datagram = DatagramPacket(buffer, buffer.size)
             try {
                 socket.receive(datagram)
+            } catch (_: java.net.SocketTimeoutException) {
+                resend.fireDue(SystemClock.elapsedRealtime()) { request -> sendResend(request) }
+                continue
             } catch (_: Exception) {
                 return
             }
             if (datagram.length <= OVERHEAD) continue
             if (realtimePackets == 0) {
+                // The audio itself is the only reliable statement of where the sender is; the
+                // control port it named in the SETUP is where the requests have to go.
+                senderAddress = datagram.address
                 SinkLog.i(
-                    "AP2: first realtime packet ${datagram.length}B from ${datagram.socketAddress}",
+                    "AP2: first realtime packet ${datagram.length}B from ${datagram.socketAddress}" +
+                        if (senderControlPort != 0) {
+                            " — resends go to ${datagram.address.hostAddress}:$senderControlPort"
+                        } else {
+                            " — the SETUP named no control port, so losses cannot be re-asked"
+                        },
                 )
             }
             realtimePackets++
@@ -658,6 +716,38 @@ class Ap2Streams(
                 )
             }
             handlePacket(buffer.copyOf(datagram.length), realtime = true)
+            resend.fireDue(SystemClock.elapsedRealtime()) { request -> sendResend(request) }
+        }
+    }
+
+    /**
+     * Puts one resend request on the wire.
+     *
+     * Returns false when nothing could be sent — no control port named, no address learned yet, or
+     * a recent failure still holds the socket back — so the tracker keeps the hole rather than
+     * writing it off. The hold-back is shairport-sync's `resend_error_backoff_time`: on a link that
+     * is genuinely gone, every idle tick would otherwise be another `sendto` that cannot work.
+     */
+    private fun sendResend(request: Resend.Request): Boolean {
+        val control = controlSocket ?: return false
+        val address = senderAddress ?: return false
+        if (senderControlPort == 0) return false
+        val now = SystemClock.elapsedRealtime()
+        if (now < resendBlockedUntil) return false
+        val datagram = Resend.encode(request.first, request.count)
+        return try {
+            control.send(DatagramPacket(datagram, datagram.size, address, senderControlPort))
+            resendRequests++
+            if (resendRequests <= 3) {
+                SinkLog.i(
+                    "AP2: asking again for ${request.count} packet(s) from seq ${request.first}",
+                )
+            }
+            true
+        } catch (error: Exception) {
+            resendBlockedUntil = now + Resend.ERROR_BACKOFF_MS
+            SinkLog.w("AP2: resend request failed: ${error.message}")
+            false
         }
     }
 
@@ -739,6 +829,10 @@ class Ap2Streams(
                 )
             }
         }
+        // Playback ordering is taken from the timestamp above, but a request has to name the
+        // header's own 16-bit sequence, so gaps are tracked in that space instead. Done after
+        // decryption: a frame that did not decrypt has not really arrived.
+        if (realtime) resend.onPacket(beUShort(packet, 2), SystemClock.elapsedRealtime())
         audioFrames++
         onAudio(sequence, timestamp, payload)
     }
@@ -795,9 +889,16 @@ class Ap2Streams(
     private fun beUShort(bytes: ByteArray, offset: Int): Int =
         ((bytes[offset].toInt() and 0xFF) shl 8) or (bytes[offset + 1].toInt() and 0xFF)
 
-    /** The sender's RTCP reports are not acted on; draining the port keeps the kernel from filling. */
+    /**
+     * The RTCP socket, which is also where a retransmission comes back.
+     *
+     * Ordinary control packets are not acted on; draining the port keeps the kernel from filling.
+     * A retransmission, though, is audio the speaker is still waiting for: it arrives with four
+     * bytes of prefix in front of the packet, so stripping that and handing the rest to
+     * [handlePacket] reuses the whole realtime path — same decrypt, same nonce, same ordering.
+     */
     private fun drainControl(socket: DatagramSocket) {
-        val buffer = ByteArray(2048)
+        val buffer = ByteArray(MAX_FRAME_BYTES + 4)
         var packets = 0
         while (!closed.get()) {
             val packet = DatagramPacket(buffer, buffer.size)
@@ -810,6 +911,16 @@ class Ap2Streams(
                 SinkLog.i(
                     "AP2: first control packet ${packet.length}B from ${packet.socketAddress}",
                 )
+            }
+            if (packet.length <= 4 + OVERHEAD) continue
+            if ((buffer[1].toInt() and 0x7F) == TYPE_RESEND_REPLY) {
+                resendReplies++
+                if (resendReplies <= 3) {
+                    SinkLog.i(
+                        "AP2: retransmission ${packet.length - 4}B from ${packet.socketAddress}",
+                    )
+                }
+                handlePacket(buffer.copyOfRange(4, packet.length), realtime = true)
             }
         }
     }
@@ -835,6 +946,13 @@ class Ap2Streams(
      * instead of pointing the sender back at sockets that are already closed.
      */
     fun stopAudioStream() {
+        if (resendRequests > 0 || resendReplies > 0) {
+            // Both numbers, always: requests without replies is a sender ignoring us, which is a
+            // different fault from a link that loses packets and gets them back.
+            SinkLog.i(
+                "AP2: resends this stream: $resendRequests request(s), $resendReplies reply(s)",
+            )
+        }
         runCatching { audioServer?.close() }
         runCatching { realtimeSocket?.close() }
         runCatching { controlSocket?.close() }
@@ -848,6 +966,11 @@ class Ap2Streams(
 
     override fun close() {
         closed.set(true)
+        if (resendRequests > 0 || resendReplies > 0) {
+            SinkLog.i(
+                "AP2: resends this stream: $resendRequests request(s), $resendReplies reply(s)",
+            )
+        }
         runCatching { eventServer?.close() }
         runCatching { audioServer?.close() }
         runCatching { realtimeSocket?.close() }

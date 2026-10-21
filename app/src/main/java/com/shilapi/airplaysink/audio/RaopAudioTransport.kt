@@ -35,14 +35,13 @@ class RaopAudioTransport(
     private val sessionKey: ByteArray?,
     private val sessionIv: ByteArray?,
     /**
-     * How many times a gap is asked for before it is left to the receiver to play out.
+     * How long a packet can sit in the queue before it is due at the speaker.
      *
-     * Sized by the caller from the pipeline's gap window, because asking again is only worth
-     * anything while playback is still waiting: past that the answer arrives to find the hole
-     * already concealed. A deep cushion therefore gets a longer schedule, and each ask is one
-     * 8 byte datagram. Public so the session can log what it actually chose.
+     * The whole retransmission budget is derived from it — see [ResendTracker] — and it is the
+     * sender's own latency less what the backend holds (shairport-sync's
+     * `conn->latency` in `rtp.c:1656`). Public so the session can log what it chose.
      */
-    val maxResendAttempts: Int = 4,
+    val queueWindowMs: Long = Resend.QUEUE_WINDOW_MS,
 ) : Closeable {
 
     companion object {
@@ -54,72 +53,11 @@ class RaopAudioTransport(
         const val TYPE_TIMING_REQUEST = 0x52
         const val TYPE_TIMING_REPLY = 0x53
         const val MAX_DATAGRAM = 4096
-        const val MAX_RESEND_SPAN = 128
 
         /** Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01). */
         const val NTP_UNIX_OFFSET_S = 2_208_988_800L
 
-        /**
-         * Throttle between resend requests. A gap is only ever asked for once by
-         * [unwrapSequence] — it moves `expectedSequence` past the hole as soon as the request is
-         * queued — so this only spaces out *different* gaps.
-         *
-         * This used to be 250 ms, which answered a burst of loss with a single request, and then
-         * 40 ms, which is still coarse: packets are 8 ms apart, so a burst leaves several gaps
-         * queued at once and those were asked for one per 40 ms — the fourth gap in a burst went
-         * out 160 ms after the first, well past the pipeline's own wait. 12 ms fits a burst of ten
-         * inside a 150 ms window and still caps the wire at ~80 requests a second, which the link
-         * carries without noticing: measured over fifteen minutes the sender is asked about once
-         * every two seconds outside a burst.
-         */
-        const val RESEND_BACKOFF_MS = 12L
         const val SOCKET_TIMEOUT_MS = 400
-
-        /**
-         * How many times a gap is asked for before it is left to the receiver to play out.
-         *
-         * One request per gap is what the code did, and over nineteen minutes of playback 68 holes
-         * still reached the pipeline as skips against 134 that were filled — i.e. a third of the
-         * losses were never recovered. Some of those requests were dropped on the floor by
-         * [RESEND_BACKOFF_MS] alone, which is pure loss: the gap had been noticed, the sender was
-         * never told. A second ask costs one 8 byte datagram and lands 45 ms after the first, still
-         * inside the pipeline's own wait for the gap.
-         *
-         * The default is the floor; the caller sizes the real figure from the gap window. See
-         * [maxResendAttempts].
-         */
-        const val MAX_RESEND_ATTEMPTS = 4
-        const val RESEND_ATTEMPT_CEILING = 12
-
-        /**
-         * The retry schedule that fits inside a gap window of [gapWaitMs].
-         *
-         * The first ask goes out one [NACK_DELAY_MS] after the hole is noticed and each further
-         * one [RESEND_RETRY_MS] later, so the last has to land before playback stops waiting;
-         * asking after that buys a packet that will be dropped on arrival and only adds traffic to
-         * a link that is already losing packets.
-         */
-        fun attemptsFor(gapWaitMs: Long): Int =
-            ((gapWaitMs - NACK_DELAY_MS) / RESEND_RETRY_MS).toInt()
-                .coerceIn(MAX_RESEND_ATTEMPTS, RESEND_ATTEMPT_CEILING)
-        const val RESEND_RETRY_MS = 45L
-
-        /**
-         * How long a gap has to stay a gap before it is worth asking about.
-         *
-         * Most holes in the sequence are the sender's packets arriving out of order, not lost, and
-         * over a hotspot they sort themselves out in a few milliseconds. Asking immediately turned
-         * an entirely self-healing reordering into a retransmission: measured on the head unit,
-         * roughly 18 requests a second went out while only about 0.3 gaps a second ever reached
-         * the pipeline as an actual hole — the rest had already arrived by the time playback got
-         * there. Crying wolf that often is not just noise on the wire, it buries the one number
-         * worth watching. 35 ms filters the reordering and still leaves the reply plenty of time
-         * to land inside the pipeline's own wait for the gap.
-         */
-        const val NACK_DELAY_MS = 35L
-
-        /** Ceiling on the queue above, so a sender that stops streaming cannot grow it forever. */
-        const val MAX_RESEND_QUEUE = 64
 
         /**
          * How often the clock-sync request is sent, mirroring shairport-sync's `rtp_timing_sender`:
@@ -132,12 +70,6 @@ class RaopAudioTransport(
 
         /** A reply whose round trip exceeds this is discarded as unusable (shairport uses 200 ms). */
         const val TIMING_MAX_RTT_NS = 200_000_000L
-
-        /**
-         * How many packets in a row may arrive behind the expected one before that is read as the
-         * sender having restarted its sequence. Reordering never runs this deep.
-         */
-        const val RESYNC_AFTER_LATE_PACKETS = 96
 
         /**
          * How long a session may stay silent after RECORD before we say so out loud. A phone that
@@ -166,10 +98,6 @@ class RaopAudioTransport(
     @Volatile
     private var startedAt = 0L
 
-    private var expectedSequence = -1
-    private var lastResendAt = 0L
-    private var latePackets = 0
-
     // Sequence numbers are 16 bit; they are unwrapped into a monotonic counter for the pipeline.
     private var highestRaw = -1
     private var highestAbsolute = 0L
@@ -182,15 +110,16 @@ class RaopAudioTransport(
      */
     private val stateLock = Any()
 
-    /** A gap noticed but not yet asked for, with the moment it becomes worth asking about. */
-    private class ResendWait(
-        val first: Int,
-        val count: Int,
-        val dueAt: Long,
-        val attempts: Int = 0,
-    )
+    /**
+     * Retransmission bookkeeping — the same object the AirPlay 2 path uses.
+     *
+     * It keeps its own hole table and its own deadlines, so a loss is chased on the clock rather
+     * than on a retry count, and the playhead is never held up by it.
+     */
+    private val resend = ResendTracker(windowMs = queueWindowMs)
 
-    private val resendQueue = java.util.ArrayDeque<ResendWait>()
+    /** When the socket may be tried again after a failed send; see [requestResend]. */
+    private var resendBlockedUntil = 0L
 
     private var audioPackets = 0L
     private var resendReplies = 0L
@@ -436,9 +365,10 @@ class RaopAudioTransport(
             pipeline.submit(sequence, rtpTime.toLong() and 0xFFFFFFFFL, payload)
 
             // Whatever this packet was, it is no longer missing — and with it out of the way the
-            // queue may hold gaps that are now old enough to be worth asking about.
-            cancelResendLocked(rawSequence)
-            fireDueResendsLocked()
+            // table may hold holes that are now old enough to be worth asking about.
+            val now = SystemClock.elapsedRealtime()
+            resend.onPacket(rawSequence, now)
+            resend.fireDue(now) { request -> requestResend(request.first, request.count) }
         }
     }
 
@@ -447,124 +377,44 @@ class RaopAudioTransport(
         if (highestRaw < 0) {
             highestRaw = raw
             highestAbsolute = 0L
-        } else {
-            val forward = (raw - highestRaw) and 0xFFFF
-            if (forward in 1..0x7FFF) {
-                highestRaw = raw
-                highestAbsolute += forward.toLong()
-            } else if (forward > 0x7FFF) {
-                return highestAbsolute - (((highestRaw - raw) and 0xFFFF).toLong())
-            }
+            return 0L
         }
-
-        if (expectedSequence >= 0) {
-            // Unsigned 16 bit arithmetic, so the three cases are: 0 = the packet we were waiting
-            // for, a small positive distance = a gap, and anything from 0x8000 up = a packet that
-            // is *behind* what we are waiting for, i.e. one that merely arrived late.
-            val delta = (raw - expectedSequence) and 0xFFFF
-            when {
-                delta == 0 -> {
-                    latePackets = 0
-                    expectedSequence = (raw + 1) and 0xFFFF
-                }
-                delta <= MAX_RESEND_SPAN -> {
-                    latePackets = 0
-                    queueResendLocked(expectedSequence, delta)
-                    expectedSequence = (raw + 1) and 0xFFFF
-                }
-                // A late packet. This is the case that used to be wrong: it lands in the same
-                // bucket as a real discontinuity because the unsigned subtraction wraps, so
-                // `expectedSequence` was dragged back to just after it. Every packet after that
-                // then looked like a one packet gap and was asked for again — including packets
-                // that had already arrived. That is where the 18 requests a second came from on a
-                // link losing a third of a packet a second, and it is why the retransmissions that
-                // did come back were for the wrong packets. A late packet tells us nothing about
-                // what is still missing, so the expectation must not move.
-                delta >= 0x8000 -> {
-                    // Unless nothing else is arriving at all, which means the sender restarted its
-                    // sequence rather than that these are all late. Resync then, or the expectation
-                    // would stay ahead of a stream that has moved on and nothing would ever be
-                    // asked for again.
-                    if (++latePackets > RESYNC_AFTER_LATE_PACKETS) {
-                        latePackets = 0
-                        expectedSequence = (raw + 1) and 0xFFFF
-                    }
-                }
-                else -> {
-                    // A jump too far forward to be a gap: resynchronise without asking.
-                    latePackets = 0
-                    expectedSequence = (raw + 1) and 0xFFFF
-                }
-            }
-        } else {
-            expectedSequence = (raw + 1) and 0xFFFF
+        val forward = (raw - highestRaw) and 0xFFFF
+        if (forward in 1..0x7FFF) {
+            highestRaw = raw
+            highestAbsolute += forward.toLong()
+        } else if (forward > 0x7FFF) {
+            return highestAbsolute - (((highestRaw - raw) and 0xFFFF).toLong())
         }
         return highestAbsolute
     }
 
-    /** Must be called while holding [stateLock]. */
-    private fun queueResendLocked(first: Int, count: Int) {
-        if (resendQueue.size >= MAX_RESEND_QUEUE) resendQueue.removeFirst()
-        resendQueue.addLast(ResendWait(first, count, SystemClock.elapsedRealtime() + NACK_DELAY_MS))
-    }
-
     /**
-     * Must be called while holding [stateLock]. A packet that turned up on its own — however late
-     * — is not a loss, and asking for it again would only make the sender resend something we
-     * already have.
+     * Sends one resend request.
+     *
+     * Returns false when the write could not go out — either no route yet, or a recent failure is
+     * still holding the socket back — so the hole stays in the table. shairport-sync backs off
+     * `resend_error_backoff_time` (0.3 s) after a failure for the same reason: a link that is gone
+     * would otherwise turn every tick into another doomed `sendto`, and that traffic competes with
+     * the audio that is still arriving.
      */
-    private fun cancelResendLocked(raw: Int) {
-        if (resendQueue.isEmpty()) return
-        val iterator = resendQueue.iterator()
-        while (iterator.hasNext()) {
-            val wait = iterator.next()
-            if (((raw - wait.first) and 0xFFFF) < wait.count) iterator.remove()
-        }
-    }
-
-    /** Must be called while holding [stateLock]. */
-    private fun fireDueResendsLocked() {
-        if (resendQueue.isEmpty()) return
+    private fun requestResend(first: Int, count: Int): Boolean {
         val now = SystemClock.elapsedRealtime()
-        while (resendQueue.isNotEmpty() && resendQueue.first().dueAt <= now) {
-            val wait = resendQueue.removeFirst()
-            val sentAt = requestResend(wait.first, wait.count)
-            if (sentAt == 0L) {
-                // Throttled, not answered: the gap is still a gap, so it goes back in the queue
-                // instead of being dropped. Dropping it meant the sender was never asked at all,
-                // and that hole was then certain to be played out as a skip.
-                resendQueue.addFirst(
-                    ResendWait(wait.first, wait.count, now + RESEND_BACKOFF_MS, wait.attempts),
-                )
-                return
-            }
-            if (wait.attempts + 1 < maxResendAttempts) {
-                // Not confirmed yet — a reply cancels this entry, silence brings it back round.
-                resendQueue.addLast(
-                    ResendWait(wait.first, wait.count, sentAt + RESEND_RETRY_MS, wait.attempts + 1),
-                )
-            }
-        }
-    }
+        if (now < resendBlockedUntil) return false
 
-    /** Sends one resend request. Returns when it went out, or 0 if the throttle held it back. */
-    private fun requestResend(first: Int, count: Int): Long {
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastResendAt < RESEND_BACKOFF_MS) return 0L
-        lastResendAt = now
-
-        val request = ByteArray(8)
-        request[0] = 0x80.toByte()
-        request[1] = 0xD5.toByte() // Apple "resend"
-        Codec.putBe16(request, 2, 1)
-        Codec.putBe16(request, 4, first)
-        Codec.putBe16(request, 6, count)
-        resendRequests++
-        runCatching {
+        // One encoder for both transports: a malformed request is ignored by the sender, which
+        // reads exactly like a sender that has nothing left to resend.
+        val request = Resend.encode(first, count)
+        return try {
             controlSocket.send(DatagramPacket(request, request.size, senderControl))
+            resendRequests++
             if (resendRequests <= 3) SinkLog.i("Requesting resend of $count packet(s) from seq $first")
-        }.onFailure { SinkLog.w("Resend request failed: ${it.message}") }
-        return now
+            true
+        } catch (error: Exception) {
+            resendBlockedUntil = now + Resend.ERROR_BACKOFF_MS
+            SinkLog.w("Resend request failed: ${error.message}")
+            false
+        }
     }
 
     /**
