@@ -18,15 +18,22 @@ android {
 
     // The head unit is a plain Android device: no automotive library, no CarPlay host.
     // Signing for a car install is done locally with the release keystore below.
+    // When ANDROID_KEYSTORE_PATH is unset (or points nowhere) the release build is left
+    // unsigned: a missing storeFile would otherwise fail validateSigningRelease.
+    val keystorePath = providers.environmentVariable("ANDROID_KEYSTORE_PATH").orNull
+    val keystoreFile = keystorePath?.let { file(it) }?.takeIf { it.isFile }
+    if (keystorePath != null && keystoreFile == null) {
+        logger.warn("ANDROID_KEYSTORE_PATH=$keystorePath not found; release APK will be unsigned")
+    }
+
     signingConfigs {
-        create("release") {
-            storeFile = file(
-                providers.environmentVariable("ANDROID_KEYSTORE_PATH")
-                    .getOrElse("missing-release-keystore.jks"),
-            )
-            storePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").getOrElse("")
-            keyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").getOrElse("")
-            keyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").getOrElse("")
+        if (keystoreFile != null) {
+            create("release") {
+                storeFile = keystoreFile
+                storePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").getOrElse("")
+                keyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").getOrElse("")
+                keyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").getOrElse("")
+            }
         }
     }
 
@@ -36,7 +43,8 @@ android {
         }
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            // null = unsigned, lets assembleRelease run without a keystore
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 

@@ -534,6 +534,22 @@ export ANDROID_KEY_PASSWORD=...
 
 工具链版本：Gradle 9.5.0 wrapper、AGP 9.3.0（内置 Kotlin，**不需要** kotlin-android 插件）、compileSdk 37、minSdk 26。
 
+### 用 `build.sh`
+
+仓库根的 `build.sh` 把上面几条包了一层：会检查 JDK 17 与 `sdk.dir`（缺 `platforms;android-37.0` 时调 `sdkmanager` 自动装），
+日志落到 `build/logs/<target>.log`，失败时把 `e:` / `FAILURE:` 行摘出来，**退出码就是 gradle 的退出码**。
+
+| 命令 | 作用 |
+| --- | --- |
+| `./build.sh`　或　`./build.sh debug` | Debug APK → `app/build/outputs/apk/debug/app-debug.apk` |
+| `./build.sh release` | Release APK；没有 `ANDROID_KEYSTORE_*` 时产出 `app-release-unsigned.apk`（不签名，不报错） |
+| `./build.sh install` | 编译 Debug 并 `adb install -r`，最后打印启动命令 |
+| `./build.sh test` | JVM 单测，报告在 `app/build/reports/tests/testDebugUnitTest/index.html` |
+| `./build.sh clean` | 用 `:app:clean` 删 `app/build`，再删 `build/logs` |
+
+`release` 找不到 keystore 时不会失败：`signingConfig` 为 `null`，AGP 直接产出 unsigned 包。
+（早前版本把 `storeFile` 指向一个不存在的默认文件，`validateSigningRelease` 会让整个 release 构建失败，已改。）
+
 `namespace` / `applicationId` 均为 `com.shilapi.airplaysink`。如果需要换成自己的包名，改 `app/build.gradle.kts` 里的 `namespace`、`applicationId` 以及 `app/src/main/java/com/shilapi/airplaysink/` 的目录名。
 
 ---
