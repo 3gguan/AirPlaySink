@@ -59,18 +59,21 @@ class DacpClient(
         PREVIOUS("previtem"),
 
         /*
-         * Seeking, as a scan that has to be started and stopped. DACP spells the start `beginrew` /
-         * `beginff` and has no endpoint at all for the stop (shairport-sync's command table leaves
-         * both stop slots NULL), which is why AirPlay 1 refuses all four: leaving a phone scanning
-         * with no way to stop it is worse than not scanning. AirPlay 2 has the stop commands, so
-         * that is the only protocol this receiver sends them on.
+         * Seeking, as a scan that has to be started and stopped.
          *
-         * The `path` of the two stop entries is never used — there is no DACP endpoint behind it.
+         * DACP spells the start `beginff` / `beginrew` and has **no** `endff` / `endrew`
+         * (shairport-sync's command table leaves both stop slots NULL, and so does Apple's own
+         * published command list). What it does have is `playresume`, described in the AirPlay
+         * remote-control spec as "play after fast forward or rewind" — that is the stop half, and
+         * it is the same endpoint for both directions.
+         *
+         * AirPlay 2 has a dedicated pair instead (9 ends 8, 11 ends 10), so the two protocols use
+         * different commands for the same gesture; the caller only ever names the direction.
          */
         SEEK_BACKWARD("beginrew"),
         SEEK_FORWARD("beginff"),
-        SEEK_BACKWARD_STOP("endrew"),
-        SEEK_FORWARD_STOP("endff"),
+        SEEK_BACKWARD_STOP("playresume"),
+        SEEK_FORWARD_STOP("playresume"),
     }
 
     private companion object {

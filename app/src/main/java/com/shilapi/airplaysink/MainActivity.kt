@@ -709,16 +709,19 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     /**
      * Begins a scan that runs for as long as the button is held.
      *
-     * One command starts it and one stops it, which is how the phone models scrubbing: 8 runs
-     * forward until 9 arrives, 10 runs backward until 11. There is deliberately no repeat loop —
-     * a scan is continuous, and re-sending "start" would only re-issue something already running.
+     * One command starts it and one stops it, which is how the phone models scrubbing: under
+     * AirPlay 2, 8 runs forward until 9 arrives and 10 runs backward until 11; under AirPlay 1 the
+     * same pair is `beginff`/`beginrew` and `playresume`. There is deliberately no repeat loop — a
+     * scan is continuous, and re-sending "start" would only re-issue something already running.
      */
     private fun startSeeking(start: DacpClient.Command, stop: DacpClient.Command, labelRes: Int) {
         val state = SinkModel.state
         val label = getString(labelRes)
-        if (state.protocol != SinkProtocol.AP2 || !state.ap2RemoteEnabled) {
+        // Only AirPlay 2 needs the switch checked here: AirPlay 1 goes over DACP, and if that
+        // endpoint is not up the command path logs it with the reason.
+        if (state.protocol == SinkProtocol.AP2 && !state.ap2RemoteEnabled) {
             SinkLog.i(
-                "UI: \"$label\" held, but scanning needs AirPlay 2 remote control " +
+                "UI: \"$label\" held, but a scan under AirPlay 2 needs the remote control switch " +
                     "(protocol=${state.protocol}, ap2Remote=${state.ap2RemoteEnabled})",
             )
             toast(getString(R.string.ui_seek_needs_ap2))

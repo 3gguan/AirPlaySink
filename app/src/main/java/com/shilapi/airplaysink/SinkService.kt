@@ -581,27 +581,22 @@ class SinkService : Service(), RaopEvents {
     /** Relays a command coming from the UI buttons or a media key. */
     private fun relayRemoteCommand(command: DacpClient.Command) {
         /*
-         * Seeking is a scan with two halves, and DACP only has the first one: `beginff` / `beginrew`
-         * start it, and there is no endpoint to stop it again (shairport-sync's own DACP table
-         * leaves both stop entries NULL). AirPlay 2 has 9 and 11 for exactly that, so the four scan
-         * commands only ever travel on the AP2 channel; AirPlay 1 gets an honest refusal.
+         * A scan has two halves and each protocol names them differently.
+         *
+         * AirPlay 2: 8 starts a forward scan and 9 ends it, 10/11 the same backwards — one channel,
+         * no credentials needed. AirPlay 1: `beginff` / `beginrew` start it and `playresume` —
+         * "play after fast forward or rewind" — brings it back, all over DACP. Neither protocol has
+         * an `endff`, which is why the four commands cannot simply be forwarded blind.
          */
-        if (command in SEEK_COMMANDS) {
-            if (SinkModel.state.protocol == SinkProtocol.AP2) {
-                if (preferences.ap2Remote) {
-                    sendAp2RemoteAsync(command) { }
-                } else {
-                    // The one silent dead end left in this path: the switch is off, so the scan has
-                    // nowhere to go. A held wheel key would look like a key that never arrived.
-                    SinkLog.w(
-                        "Remote control \"${command.path}\" ignored — a scan under AirPlay 2 needs " +
-                            "the \"AP2 remote control\" switch",
-                    )
-                }
+        if (command in SEEK_COMMANDS && SinkModel.state.protocol == SinkProtocol.AP2) {
+            if (preferences.ap2Remote) {
+                sendAp2RemoteAsync(command) { }
             } else {
+                // The one silent dead end left in this path: the switch is off, so the scan has
+                // nowhere to go. A held wheel key would look like a key that never arrived.
                 SinkLog.w(
-                    "Remote control \"${command.path}\" ignored — scanning needs AirPlay 2; " +
-                        "DACP has no endpoint that stops a scan once it starts",
+                    "Remote control \"${command.path}\" ignored — a scan under AirPlay 2 needs " +
+                        "the \"AP2 remote control\" switch",
                 )
             }
             return

@@ -497,9 +497,15 @@ class RaopAudioTransport(
                 val rawRtpTime = Codec.be32(data, 16).toLong() and 0xFFFFFFFFL
                 val senderNtpNs = ntpToNanos(data, 8)
                 if (syncPackets <= 2) {
+                    // Both halves are unsigned 32 bit: printed straight from `be32` the seconds
+                    // came out as a negative number (-2085016132) and the fraction as a decimal
+                    // that only looked plausible. Show them the way the wire has them.
+                    val ntpSeconds = Codec.be32(data, 8).toLong() and 0xFFFFFFFFL
+                    val ntpFractionNs =
+                        ((Codec.be32(data, 12).toLong() and 0xFFFFFFFFL) * 1_000_000_000L) ushr 32
                     SinkLog.i(
                         "Timing sync #$syncPackets now=${nowRtpTime} raw=$rawRtpTime " +
-                            "ntp=${Codec.be32(data, 8)}.${Codec.be32(data, 12)}",
+                            "ntp=$ntpSeconds.${ntpFractionNs.toString().padStart(9, '0')}",
                     )
                 }
                 // The sender's latency is `raw - now`: how far the raw stream runs ahead of the

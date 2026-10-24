@@ -20,7 +20,7 @@
 | 音量控制（`volume: -xx.xx` dB） | ✅ |
 | **DACP 反向控制**（用方向盘 / 界面按钮遥控 iPhone 切歌、播放暂停） | ✅ 仅 **AirPlay 1** |
 | **AP2 反向控制**（`sendMediaRemoteCommand`，走事件通道） | ✅ 默认开启，见下文 |
-| **快进 / 快退**（长按上一首 / 下一首，一次一步） | ✅ 仅 **AirPlay 2**（命令 8/9、10/11） |
+| **快进 / 快退**（长按上一首 / 下一首，一次一步） | ✅ AP2 用命令 8/9、10/11；AP1 用 DACP `beginff`/`beginrew` + `playresume` |
 | 前台服务 + Wi-Fi Lock + Multicast Lock，息屏继续接收 | ✅ |
 | 开机自启（可选） | ✅ |
 | 进程被杀后自动恢复（START_STICKY + 网络事件拉起） | ✅ |
@@ -640,12 +640,12 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 方向盘切歌键按住 0.5 秒以上，改发扫描命令：
 
-| 操作 | 发出的命令（AP2） | 命令号 |
-| --- | --- | --- |
-| 短按上一首 | `previousitem` | 5 |
-| 短按下一首 | `nextitem` | 4 |
-| 按住上一首 | `beginrew` → 0.9 秒后 `endrew` | 10 → 11 |
-| 按住下一首 | `beginff` → 0.9 秒后 `endff` | 8 → 9 |
+| 操作 | 发出的命令（AP2） | 命令号 | 发出的命令（AP1 / DACP） |
+| --- | --- | --- | --- |
+| 短按上一首 | `previousitem` | 5 | `previtem` |
+| 短按下一首 | `nextitem` | 4 | `nextitem` |
+| 按住上一首 | `beginrew` → 0.9 秒后 `endrew` | 10 → 11 | `beginrew` → 0.9 秒后 `playresume` |
+| 按住下一首 | `beginff` → 0.9 秒后 `endff` | 8 → 9 | `beginff` → 0.9 秒后 `playresume` |
 
 六点要注意：
 
@@ -660,8 +660,11 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - **一次长按只跳一步，所以 burst 是 0.9 秒**。iPhone 的"快进"不是连续播放，而是**跳**：`beginff`
   之后约 80ms 跳第一次，然后每约 1.05 秒再跳一次 —— 之前 3 秒的 burst 正好凑出三次跳跃，一个手势
   把曲目拖了三段。0.9 秒落在第一次之后、第二次之前，一次长按就是干干净净的一步。
-- **扫描必须走 AP2**。DACP 只有 `beginff`/`beginrew`，没有停止端点（shairport-sync 的 DACP
-  表里两个停止端点都是 NULL），所以 AP1 会被拒绝并写日志；AP2 还需要打开「AP2 反向控制」开关。
+- **两代协议各有一套命令，互不相同**。AirPlay 2 用 8/9（快进）和 10/11（快退）。AirPlay 1 只有
+  DACP：`beginff` / `beginrew` 开始，**`playresume`** 结束 —— 规范里它的说明就是 "play after fast
+  forward or rewind"，DACP 里没有 `endff` / `endrew`（shairport-sync 的命令表和苹果公布的命令表
+  都是这个结论），`playresume` 才是那缺失的另一半，两个方向共用同一个端点。AP2 还需要打开
+  「AP2 反向控制」开关。
 - **还有 20 秒硬上限**兜底，万一结束事件丢了，也不会一路扫到曲末。
 
 三种键形都认：
