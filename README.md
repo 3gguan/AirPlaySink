@@ -20,7 +20,7 @@
 | 音量控制（`volume: -xx.xx` dB） | ✅ |
 | **DACP 反向控制**（用方向盘 / 界面按钮遥控 iPhone 切歌、播放暂停） | ✅ 仅 **AirPlay 1** |
 | **AP2 反向控制**（`sendMediaRemoteCommand`，走事件通道） | ✅ 默认开启，见下文 |
-| **快进 / 快退**（长按上一首 / 下一首，松手停） | ✅ 仅 **AirPlay 2**（命令 8/9、10/11） |
+| **快进 / 快退**（长按上一首 / 下一首，一次一步） | ✅ 仅 **AirPlay 2**（命令 8/9、10/11） |
 | 前台服务 + Wi-Fi Lock + Multicast Lock，息屏继续接收 | ✅ |
 | 开机自启（可选） | ✅ |
 | 进程被杀后自动恢复（START_STICKY + 网络事件拉起） | ✅ |
@@ -635,6 +635,89 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 不管哪个键、走哪一代协议，最终都是同一条链路的两端之一：AP1 走 DACP，AP2 走
 `sendMediaRemoteCommand` —— 所以界面上的三个按钮就是最好的验证：按钮能用，说明遥控通了。
+
+### 长按上一首 / 下一首 = 快退 / 快进
+
+方向盘切歌键按住 0.5 秒以上，改发扫描命令：
+
+| 操作 | 发出的命令（AP2） | 命令号 |
+| --- | --- | --- |
+| 短按上一首 | `previousitem` | 5 |
+| 短按下一首 | `nextitem` | 4 |
+| 按住上一首 | `beginrew` → 0.9 秒后 `endrew` | 10 → 11 |
+| 按住下一首 | `beginff` → 0.9 秒后 `endff` | 8 → 9 |
+
+六点要注意：
+
+- **比亚迪的长按是独立键码，不是"按住 87 不放"**。方向盘按住下一首/上一首时，车机根本不重复
+  87/88，而是直接发 **302 / 303**（框架里叫 `KEYCODE_AUTO_MEDIA_NEXT_LP` / `..._PREVIOUS_LP`）。
+  这是"长按没反应"的真因：旧版只认 87/88，302/303 被当成陌生键放行了。
+- **302/303 是脉冲，不是按住状态**。实测 8 次，down 和 up 相隔 13–85ms，按多久都一样 —— 车机只
+  告诉你"按了长按"，不告诉你按了多久。所以扫描时长由这边定（`BURST_MILLIS`）。
+- **但松手事件不是直接丢掉，而是先量一下**。up 距 down 小于 `PULSE_RELEASE_MILLIS`（200ms）才算
+  脉冲回声——手指还按着就到了，结束扫描的活儿交给定时器；超过这个间隔就只能是手指真的抬起来了，
+  于是立刻停扫。这样无论车机是"发脉冲"还是"按住期间保持 down"，行为都对。
+- **一次长按只跳一步，所以 burst 是 0.9 秒**。iPhone 的"快进"不是连续播放，而是**跳**：`beginff`
+  之后约 80ms 跳第一次，然后每约 1.05 秒再跳一次 —— 之前 3 秒的 burst 正好凑出三次跳跃，一个手势
+  把曲目拖了三段。0.9 秒落在第一次之后、第二次之前，一次长按就是干干净净的一步。
+- **扫描必须走 AP2**。DACP 只有 `beginff`/`beginrew`，没有停止端点（shairport-sync 的 DACP
+  表里两个停止端点都是 NULL），所以 AP1 会被拒绝并写日志；AP2 还需要打开「AP2 反向控制」开关。
+- **还有 20 秒硬上限**兜底，万一结束事件丢了，也不会一路扫到曲末。
+
+三种键形都认：
+
+| 车机怎么报 | 判定方式 |
+| --- | --- |
+| 87/88（`KEYCODE_MEDIA_NEXT/PREVIOUS`）按住重复 | 自己计时 0.5 秒，松手停 |
+| 302/303（BYD 的长按键码） | 收到即扫，0.9 秒定时停；若 up 晚于 200ms 则 up 停 |
+| 90/89（`KEYCODE_MEDIA_FAST_FORWARD/REWIND`） | 按下即扫，松开即停 |
+
+同一个手势有时会**同时**从窗口和媒体会话两个入口进来（这台车机就是，相隔 40ms 左右）。扫描
+按"方向"记身份而不是按键码，所以后到的那份会被认成重复并丢弃，不会叠出两条扫描。
+
+日志前缀 `Wheel:`，一条完整链路长这样（DiLink 3 实测）：
+
+```
+Wheel: key 302 (KEYCODE_AUTO_MEDIA_NEXT_LP) down — a long press, scanning for 900ms (window)
+Wheel: sending "beginff"
+Remote control "beginff": sending over the AP2 channel (receiver=up)
+Wheel: key 302 (KEYCODE_AUTO_MEDIA_NEXT_LP) up after 39ms (window)
+Wheel: key 302 (KEYCODE_AUTO_MEDIA_NEXT_LP) burst over after 900ms — stopping the scan
+Wheel: sending "endff"
+```
+
+`up after` 后面那个毫秒数就是判别式：**几十毫秒 = 脉冲型**（手指还按着，up 是回声，扫描由定时器
+结束）；**几百毫秒以上 = 按住型**（车机保持 down 直到松手），这时紧跟一行 `released after …ms —
+stopping the scan`，扫多久完全由手指决定。
+
+短按则是：
+
+```
+Wheel: key 87 (KEYCODE_MEDIA_NEXT) down — watching for a hold (window)
+Wheel: key 87 up after 19ms — a tap
+Wheel: sending "nextitem"
+```
+
+#### 实测：8/9 会执行，但是"跳"而不是"连播"
+
+`beginff`/`endff`（8/9）和 `beginrew`/`endrew`（10/11）在这台 iPhone 上是**真的会动**，只是动的
+方式不像 shairport-sync 描述的那样连续：播放位置是**跳**的。一次 `beginff` 之后约 80ms 跳第一次，
+之后每约 1.05 秒再跳一次，每跳一次发一条 `POST /audioMode {audioMode:"default"}`。
+
+所以**判断有没有生效，数 `/audioMode` 条数**，不要只看 `200`：
+
+| burst 时长 | `/audioMode` 条数 | 实际效果 |
+| --- | --- | --- |
+| 3 秒（旧） | 3 | 一个手势拖了三段 —— "长按一次跳三次" |
+| 0.9 秒（现在） | 1 | 一步 |
+
+接收端这边看不到任何"移动"的痕迹：包速率恒定在 125 包/秒、`flushed 0`、没有
+`SETRATEANCHORTIME`。这不是没执行，而是跳变发生在播放器内部，AirPlay 只从 `/audioMode` 通知里
+漏一点出来。`200` 只表示"收到"，`/audioMode` 才表示"照做了"。
+
+哪一环缺了，就是哪一环的问题：一行 `Wheel:` 都没有 ⇒ 按键没到这个 App（界面不在前台，或车机
+把键给了自带播放器）；有 `not a skip key` ⇒ 车机用的是别的键码，那行里写着真实键码。
+
 
 ---
 

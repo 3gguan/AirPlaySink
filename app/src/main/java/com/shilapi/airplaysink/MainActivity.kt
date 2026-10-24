@@ -14,6 +14,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -282,6 +283,16 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
     }
 
     /**
+     * The steering wheel's skip keys arrive here while this page is in front — BYD gives them to the
+     * focused window rather than to the media session, which is why they have to be caught twice
+     * (here and in [SinkService]'s session callback).
+     *
+     * Returning true swallows the press so the head unit's own player never sees an unpaired key.
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean =
+        WheelKeys.onKey(event, "window") || super.dispatchKeyEvent(event)
+
+    /**
      * The name field is the only editable thing on the screen, so a tap anywhere else means "I am
      * done editing": drop the focus and the keyboard with it. Without this the field keeps focus
      * after the keyboard is dismissed and the caret goes on blinking over a page nobody is typing on.
@@ -324,6 +335,7 @@ class MainActivity : AppCompatActivity(), SinkModel.Listener {
         // A finger that was still down when the screen went away never sends ACTION_UP here, and a
         // scan outliving the page would leave the phone winding with nobody able to stop it.
         stopSeeking()
+        WheelKeys.stop()
         SinkModel.removeListener(this)
         SinkLog.listener = null
         super.onStop()

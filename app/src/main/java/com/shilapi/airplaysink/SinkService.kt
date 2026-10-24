@@ -20,6 +20,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
 import com.shilapi.airplaysink.ap2.Ap2Streams
 import com.shilapi.airplaysink.dacp.DacpClient
@@ -350,6 +351,8 @@ class SinkService : Service(), RaopEvents {
 
     private fun shutdown() {
         serving = false
+        // A scan the session can no longer answer would keep the phone winding after it ends.
+        WheelKeys.stop()
         stopReceiverOnly()
         teardownMediaSession()
         unregisterNetworkMonitor()
@@ -585,7 +588,16 @@ class SinkService : Service(), RaopEvents {
          */
         if (command in SEEK_COMMANDS) {
             if (SinkModel.state.protocol == SinkProtocol.AP2) {
-                if (preferences.ap2Remote) sendAp2RemoteAsync(command) { }
+                if (preferences.ap2Remote) {
+                    sendAp2RemoteAsync(command) { }
+                } else {
+                    // The one silent dead end left in this path: the switch is off, so the scan has
+                    // nowhere to go. A held wheel key would look like a key that never arrived.
+                    SinkLog.w(
+                        "Remote control \"${command.path}\" ignored — a scan under AirPlay 2 needs " +
+                            "the \"AP2 remote control\" switch",
+                    )
+                }
             } else {
                 SinkLog.w(
                     "Remote control \"${command.path}\" ignored — scanning needs AirPlay 2; " +
@@ -636,6 +648,18 @@ class SinkService : Service(), RaopEvents {
                 MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS,
         )
         session.setCallback(object : MediaSession.Callback() {
+            /**
+             * The raw key event, taken before the platform collapses it into onSkipToNext and
+             * friends. The wheel's skip keys need it that way: a tap changes track and a hold
+             * scans, and that difference only exists in the press/release pair.
+             */
+            override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                @Suppress("DEPRECATION")
+                val event = mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                if (event != null && WheelKeys.onKey(event, "session")) return true
+                return super.onMediaButtonEvent(mediaButtonIntent)
+            }
+
             override fun onPlay() = relayRemoteCommand(DacpClient.Command.PLAY)
             override fun onPause() = relayRemoteCommand(DacpClient.Command.PAUSE)
             override fun onStop() = relayRemoteCommand(DacpClient.Command.STOP)
